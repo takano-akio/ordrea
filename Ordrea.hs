@@ -55,6 +55,8 @@ data Priority = Priority
   }
   deriving (Eq, Ord) -- The default lexicographical ordering is appropriate
 
+nextPrio :: Priority -> Priority
+nextPrio prio@Priority{priNum=n} = prio{ priNum = n + 1 }
 
 data Signal a   = Sig {-# UNPACK #-} !Priority !(Pull a)
 data Event a    = Evt {-# UNPACK #-} !Priority !(Pull [a]) !(Push a)
@@ -248,6 +250,27 @@ start gensig = do
 
 eventToSignal :: Event a -> Signal [a]
 eventToSignal (Evt prio pull _) = Sig prio pull
+
+externalS :: IO a -> SignalGen (Signal a)
+externalS get = do
+  pull <- newCachedPull $ liftIO get
+  return $ Sig (bottomPrio bottomLocation) pull
+
+signalToEvent :: Signal [a] -> Event a
+signalToEvent (Sig sigprio pull) = Evt prio pull (join $ pushFromOccPull prio pull)
+  where
+    prio = nextPrio sigprio
+
+pushFromOccPull :: Priority -> Pull [a] -> Initialize (Push a)
+pushFromOccPull prio occPull = do
+  (push, trigger) <- liftIO newPush
+  clock <- getClock
+  let
+    trg () = do
+      occs <- occPull
+      mapM_ trigger occs
+  listenToPush clock prio trg push
+  return push
 
 ----------------------------------------------------------------------
 -- utils
