@@ -38,8 +38,10 @@ data GEnv = GEnv
   , envGenLocation :: IO Location
   }
 
-newtype IEnv = IEnv
+data IEnv = IEnv
   { envClock :: Push ()
+  , envParentLocation :: Location
+  , envRegisterFirstStep :: Consumer (Run ())
   }
 
 data REnv = REnv
@@ -55,7 +57,7 @@ data Priority = Priority
 
 
 data Signal a   = Sig {-# UNPACK #-} !Priority !(Pull a)
-data Event a    = Evt {-# UNPACK #-} !Priority !(Push a)
+data Event a    = Evt {-# UNPACK #-} !Priority !(Pull [a]) !(Push a)
 data Discrete a = Dis {-# UNPACK #-} !Priority !(Pull a) !(Push a)
 
 -- TODO: specialize
@@ -75,20 +77,32 @@ newLocationGen parentLoc = do
     writeRef counter $! num + 1
     return $! parentLoc `U.snoc` num
 
-runSignalGen :: Location -> Push () -> SignalGen a -> IO a
+runSignalGen :: Location -> Push () -> SignalGen a -> Run a
 runSignalGen parentLoc clock (SignalGen gen) = do
-  (register, runAccum) <- newActionAccum
-  locGen <- newLocationGen parentLoc
+  (registerI, runAccumI) <- liftIO newActionAccum
+  (registerF, runAccumF) <- liftIO newActionAccum
+  locGen <- liftIO $ newLocationGen parentLoc
   let
     genv = GEnv
-      { envRegisterInit = register
+      { envRegisterInit = registerI
       , envGenLocation = locGen
       }
     ienv = IEnv
       { envClock = clock
+      , envRegisterFirstStep = registerF
+      , envParentLocation = parentLoc
       }
-  result <- runReaderT gen genv
-  runReaderT runAccum ienv
+  result <- liftIO $ runReaderT gen genv
+  liftIO $ runReaderT runAccumI ienv
+  runAccumF
+  return result
+
+runRun :: Run a -> IO a
+runRun run = do
+  (registerF, runAccumF) <- liftIO newActionAccum
+  let renv = REnv { envRegisterFini = registerF }
+  result <- runReaderT run renv
+  runAccumF
   return result
 
 bottomLocation :: Location
@@ -103,6 +117,11 @@ registerInit :: Initialize () -> SignalGen ()
 registerInit ini = SignalGen $ do
   reg <- asks envRegisterInit
   lift $ reg ini
+
+registerFirstStep :: Run () -> Initialize ()
+registerFirstStep fst = do
+  reg <- asks envRegisterFirstStep
+  lift $ reg fst
 
 registerFini :: IO () -> Run ()
 registerFini fini = do
@@ -156,7 +175,7 @@ delayS initial ~(Sig _sigprio sig) = do
       registerFini $ writeRef ref newVal
     prio = bottomPrio bottomLocation
 
-newPush :: SignalGen (Push a, a -> Run ())
+newPush :: IO (Push a, a -> Run ())
 newPush = do
   listenersRef <- newRef M.empty
   return (return $ register listenersRef, invoke listenersRef)
@@ -182,18 +201,53 @@ newPush = do
               return $ Just weak
             Nothing -> return Nothing
 
+newEvent :: Priority -> SignalGen (Event a, a -> Run ())
+newEvent prio = do
+  ref <- newRef []
+  (push, trigger) <- liftIO newPush
+  registerInit $
+    listenToPush push (bottomPrio bottomLocation) (add ref) ref
+  let evt = Evt prio (reverse <$> readRef ref) push
+  return (evt, trigger)
+  where
+    add ref val = do
+      occs <- readRef ref
+      writeRef ref (val:occs)
+      when (null occs) $
+        registerFini $ writeRef ref []
+
 generatorE :: Event (SignalGen a) -> SignalGen (Event a)
-generatorE (Evt _evtprio evt) = do
+generatorE evt = do
   here <- genLocation
   let prio = bottomPrio here
-  (push, trigger) <- newPush
+  (result, trigger) <- newEvent prio
   registerInit $ do
     clock <- getClock
-    listenToPush evt prio (handler here clock trigger) here
-  return $ Evt prio push
+    listenToEvent evt prio (handler here clock trigger) result
+  return $ result
   where
     handler here clock trigger gen =
-      trigger =<< liftIO (runSignalGen here clock gen)
+      trigger =<< runSignalGen here clock gen
+
+listenToEvent :: Event a -> Priority -> (a -> Run ()) -> key -> Initialize ()
+listenToEvent (Evt evtPrio evtPull evtPush) prio handler key = do
+  listenToPush evtPush prio handler key
+  parLoc <- asks envParentLocation
+  when (priLoc evtPrio < parLoc) $
+    registerFirstStep $ do
+      initialOccs <- evtPull
+      mapM_ handler initialOccs
+
+start :: SignalGen (Signal a) -> IO (IO a)
+start gensig = do
+  (clock, clockTrigger) <- newPush
+  Sig _ sig <- runRun $ runSignalGen bottomLocation clock gensig
+  return $ runRun $ do
+    clockTrigger ()
+    sig
+
+eventToSignal :: Event a -> Signal [a]
+eventToSignal (Evt prio pull _) = Sig prio pull
 
 ----------------------------------------------------------------------
 -- utils
@@ -206,5 +260,10 @@ readRef = liftIO . readIORef
 
 writeRef :: (MonadIO m) => IORef a -> a -> m ()
 writeRef x v = liftIO $ writeIORef x v
+
+modifyRef :: (MonadIO m) => IORef a -> (a -> a) -> m ()
+modifyRef x f = do
+  old <- readRef x
+  writeRef x $! f old
 
 -- vim: sw=2 ts=2 sts=2
