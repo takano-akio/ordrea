@@ -7,6 +7,7 @@ import Control.Monad.IO.Class
 import Control.Monad.Trans.Class
 import Control.Monad.Trans.Reader
 import Data.IORef
+import Data.List
 import qualified Data.Map as M
 import Data.Maybe
 import qualified Data.Vector.Unboxed as U
@@ -230,14 +231,31 @@ newEvent :: Priority -> SignalGen (Event a, [a] -> Run ())
 newEvent prio = do
   ref <- newRef []
   (push, trigger) <- liftIO newPush
-  registerInit $
-    listenToPush push (bottomPrio bottomLocation) (add ref) ref
-  let evt = Evt prio $ return (reverse <$> readRef ref, push)
+  registerInit $ setupEventBuf ref push
+  let evt = Evt prio $ return (eventPull ref, push)
   return (evt, trigger)
+
+setupEventBuf :: IORef [a] -> Push [a] -> Initialize ()
+setupEventBuf buf push =
+    listenToPush push (bottomPrio bottomLocation) add buf
   where
-    add ref occs = do
-      writeRef ref occs
-      registerFini $ writeRef ref []
+    add occs = do
+      writeRef buf occs
+      registerFini $ writeRef buf []
+
+eventPull :: IORef [a] -> Pull [a]
+eventPull buf = reverse <$> readRef buf
+
+transformEvent :: ([a] -> [b]) -> Event a -> Event b
+transformEvent f parent@(Evt prio _) = Evt prio $ do
+  ref <- newRef []
+  (push, trigger) <- liftIO newPush
+  setupEventBuf ref push
+  listenToEvent parent prio (trigger . f) ref
+  return (eventPull ref, push)
+
+instance Functor Event where
+  fmap f = transformEvent (map f)
 
 generatorE :: Event (SignalGen a) -> SignalGen (Event a)
 generatorE evt = do
@@ -251,6 +269,18 @@ generatorE evt = do
   where
     handler here clock trigger gens =
       trigger =<< mapM (runSignalGen here clock) gens
+
+----------------------------------------------------------------------
+-- discretes
+
+newDiscrete :: a -> Priority -> SignalGen (Discrete a, Run a, a -> Run ())
+newDiscrete initial prio = do
+  ref <- newRef initial
+  (push, trigger) <- liftIO newPush
+  registerInit $
+    listenToPush push (bottomPrio bottomLocation) (writeRef ref) ref
+  let dis = Dis prio $ return (readRef ref, push)
+  return (dis, readRef ref, trigger)
 
 ----------------------------------------------------------------------
 -- signals
@@ -305,6 +335,21 @@ delayS initial ~(Sig _sigprio sig) = do
     prio = bottomPrio bottomLocation
 
 ----------------------------------------------------------------------
+-- events and discretes
+
+accumD :: a -> Event (a -> a) -> SignalGen (Discrete a)
+accumD initial evt@(~(Evt evtprio _)) = do
+  (dis, get, set) <- newDiscrete initial prio
+  registerInit $
+    listenToEvent evt prio (upd get set) dis
+  return dis
+  where
+    prio = nextPrio evtprio
+    upd get set occs = do
+      oldVal <- get
+      set $! foldl' (flip ($)) oldVal occs
+
+----------------------------------------------------------------------
 -- events and signals
 
 eventToSignal :: Event a -> Signal [a]
@@ -319,6 +364,12 @@ signalToEvent (Sig sigprio sig) = Evt prio $ do
   return (pull, push)
   where
     prio = nextPrio sigprio
+
+----------------------------------------------------------------------
+-- discretes and signals
+
+discreteToSignal :: Discrete a -> Signal a
+discreteToSignal (Dis prio dis) = Sig prio $ fst <$> dis
 
 ----------------------------------------------------------------------
 -- utils
@@ -359,5 +410,18 @@ test0 = do
   smp >>= print
   smp >>= print
   smp >>= print
+
+test1 = do
+  smp <- start $ do
+    strS <- externalS $ do
+      putStrLn "input:"
+      getLine
+    accD <- accumD "<zero>" $ append <$> signalToEvent strS
+    return $ discreteToSignal accD
+  smp >>= print
+  smp >>= print
+  smp >>= print
+  where
+    append ch str = str ++ "/" ++ show ch
 
 -- vim: sw=2 ts=2 sts=2
