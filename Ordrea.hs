@@ -20,7 +20,7 @@ type Run = ReaderT REnv IO
 type Finalize = IO
 
 newtype Signal a   = Sig (Initialize (Priority, Pull a))
-newtype Event a    = Evt (Initialize (Priority, Pull [a], Push a))
+newtype Event a    = Evt (Initialize (Priority, Pull [a], Push [a]))
 newtype Discrete a = Dis (Initialize (Priority, Pull a, Push a))
 
 type Consumer a = a -> IO ()
@@ -178,14 +178,14 @@ newPush = do
               return $ Just weak
             Nothing -> return Nothing
 
-pushFromOccPull :: Priority -> Pull [a] -> Initialize (Push a)
+pushFromOccPull :: Priority -> Pull [a] -> Initialize (Push [a])
 pushFromOccPull prio occPull = do
   (push, trigger) <- liftIO newPush
   clock <- getClock
   let
     trg () = do
       occs <- occPull
-      mapM_ trigger occs
+      when (not $ null occs) $ trigger occs
   listenToPush clock prio trg push
   return push
 
@@ -215,7 +215,7 @@ newCachedPull gencalc = do
 ----------------------------------------------------------------------
 -- events
 
-listenToEvent :: Event a -> Priority -> (a -> Run ()) -> key -> Initialize ()
+listenToEvent :: Event a -> Priority -> ([a] -> Run ()) -> key -> Initialize ()
 listenToEvent (Evt evt) prio handler key = do
   (evtPrio, evtPull, evtPush) <- evt
   listenToPush evtPush prio handler key
@@ -223,9 +223,10 @@ listenToEvent (Evt evt) prio handler key = do
   when (priLoc evtPrio < parLoc) $
     registerFirstStep $ do
       initialOccs <- evtPull
-      mapM_ handler initialOccs
+      when (not $ null initialOccs) $
+        handler initialOccs
 
-newEvent :: Priority -> SignalGen (Event a, a -> Run ())
+newEvent :: Priority -> SignalGen (Event a, [a] -> Run ())
 newEvent prio = do
   ref <- newRef []
   (push, trigger) <- liftIO newPush
@@ -234,11 +235,9 @@ newEvent prio = do
   let evt = Evt $ return (prio, reverse <$> readRef ref, push)
   return (evt, trigger)
   where
-    add ref val = do
-      occs <- readRef ref
-      writeRef ref (val:occs)
-      when (null occs) $
-        registerFini $ writeRef ref []
+    add ref occs = do
+      writeRef ref occs
+      registerFini $ writeRef ref []
 
 generatorE :: Event (SignalGen a) -> SignalGen (Event a)
 generatorE evt = do
@@ -250,8 +249,8 @@ generatorE evt = do
     listenToEvent evt prio (handler here clock trigger) result
   return $ result
   where
-    handler here clock trigger gen =
-      trigger =<< runSignalGen here clock gen
+    handler here clock trigger gens =
+      trigger =<< mapM (runSignalGen here clock) gens
 
 ----------------------------------------------------------------------
 -- signals
