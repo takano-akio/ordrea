@@ -19,9 +19,9 @@ type Initialize = ReaderT IEnv IO
 type Run = ReaderT REnv IO
 type Finalize = IO
 
-newtype Signal a   = Sig (Initialize (Priority, Pull a))
-newtype Event a    = Evt (Initialize (Priority, Pull [a], Push [a]))
-newtype Discrete a = Dis (Initialize (Priority, Pull a, Push a))
+data Signal a   = Sig !Priority !(Initialize (Pull a))
+data Event a    = Evt !Priority !(Initialize (Pull [a], Push [a]))
+data Discrete a = Dis !Priority !(Initialize (Pull a, Push a))
 
 type Consumer a = a -> IO ()
 
@@ -216,8 +216,8 @@ newCachedPull gencalc = do
 -- events
 
 listenToEvent :: Event a -> Priority -> ([a] -> Run ()) -> key -> Initialize ()
-listenToEvent (Evt evt) prio handler key = do
-  (evtPrio, evtPull, evtPush) <- evt
+listenToEvent (Evt evtPrio evt) prio handler key = do
+  (evtPull, evtPush) <- evt
   listenToPush evtPush prio handler key
   parLoc <- getParentLocation
   when (priLoc evtPrio < parLoc) $
@@ -232,7 +232,7 @@ newEvent prio = do
   (push, trigger) <- liftIO newPush
   registerInit $
     listenToPush push (bottomPrio bottomLocation) (add ref) ref
-  let evt = Evt $ return (prio, reverse <$> readRef ref, push)
+  let evt = Evt prio $ return (reverse <$> readRef ref, push)
   return (evt, trigger)
   where
     add ref occs = do
@@ -261,9 +261,9 @@ start gensig = do
   getval <- runRun $ do
     ref <- newRef undefined
     runSignalGen bottomLocation clock $ do
-      Sig sig <- gensig
+      Sig _ sig <- gensig
       registerInit $ do
-        (_, getval) <- sig
+        getval <- sig
         writeRef ref getval
     readRef ref
   return $ runRun $ do
@@ -273,31 +273,31 @@ start gensig = do
 externalS :: IO a -> SignalGen (Signal a)
 externalS get = do
   pull <- newCachedPull $ return $ liftIO get
-  return $ Sig $ return (bottomPrio bottomLocation, pull)
+  return $ Sig (bottomPrio bottomLocation) $ return pull
 
 joinS :: Signal (Signal a) -> SignalGen (Signal a)
-joinS (Sig sigsig) = do
+joinS ~(Sig _sigsigprio sigsig) = do
   here <- genLocation
   let prio = bottomPrio here
   pull <- newCachedPull $ do
     parLoc <- getParentLocation
     clock <- getClock
-    (_sigsigprio, sigpull) <- sigsig
+    sigpull <- sigsig
     return $ do
-      Sig sig <- sigpull
-      ((_sigprio, pull), first) <- liftIO $ runInit parLoc clock sig
+      Sig _sigprio sig <- sigpull
+      (pull, first) <- liftIO $ runInit parLoc clock sig
       first
       pull
-  return $! Sig $ return (prio, pull)
+  return $! Sig prio $ return pull
 
 delayS :: a -> Signal a -> SignalGen (Signal a)
-delayS initial (Sig sig) = do
+delayS initial ~(Sig _sigprio sig) = do
   ref <- newRef initial
   registerInit $ do
     clock <- getClock
-    (_sigprio, pull) <- sig
+    pull <- sig
     listenToPush clock prio (upd ref pull) ref
-  return $ Sig $ return (prio, readRef ref)
+  return $ Sig prio $ return $ readRef ref
   where
     upd ref pull () = do
       newVal <- pull
@@ -308,16 +308,17 @@ delayS initial (Sig sig) = do
 -- events and signals
 
 eventToSignal :: Event a -> Signal [a]
-eventToSignal (Evt evt) = Sig $ do
-  (prio, pull, _push) <- evt
-  return (prio, pull)
+eventToSignal (Evt prio evt) = Sig prio $ do
+  (pull, _push) <- evt
+  return pull
 
 signalToEvent :: Signal [a] -> Event a
-signalToEvent (Sig sig) = Evt $ do
-  (sigprio, pull) <- sig
-  let prio = nextPrio sigprio
+signalToEvent (Sig sigprio sig) = Evt prio $ do
+  pull <- sig
   push <- pushFromOccPull prio pull
-  return (prio, pull, push)
+  return (pull, push)
+  where
+    prio = nextPrio sigprio
 
 ----------------------------------------------------------------------
 -- utils
