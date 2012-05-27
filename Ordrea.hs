@@ -334,6 +334,9 @@ delayS initial ~(Sig _sigprio sig) = do
       registerFini $ writeRef ref newVal
     prio = bottomPrio bottomLocation
 
+instance Functor Signal where
+  fmap f (Sig prio pull) = Sig prio (fmap f <$> pull)
+
 ----------------------------------------------------------------------
 -- events and discretes
 
