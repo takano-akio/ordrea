@@ -227,13 +227,20 @@ listenToEvent (Evt evtPrio evt) prio handler key = do
       when (not $ null initialOccs) $
         handler initialOccs
 
-newEvent :: Priority -> SignalGen (Event a, [a] -> Run ())
-newEvent prio = do
+newEventSG :: Priority -> SignalGen (Event a, [a] -> Run ())
+newEventSG prio = do
   ref <- newRef []
   (push, trigger) <- liftIO newPush
   registerInit $ setupEventBuf ref push
   let evt = Evt prio $ return (eventPull ref, push)
   return (evt, trigger)
+
+newEventInit :: Initialize ((Pull [a], Push [a]), [a] -> Run ())
+newEventInit = do
+  ref <- newRef []
+  (push, trigger) <- liftIO newPush
+  setupEventBuf ref push
+  return ((eventPull ref, push), trigger)
 
 setupEventBuf :: IORef [a] -> Push [a] -> Initialize ()
 setupEventBuf buf push =
@@ -248,11 +255,9 @@ eventPull buf = reverse <$> readRef buf
 
 transformEvent :: ([a] -> [b]) -> Event a -> Event b
 transformEvent f parent@(Evt prio _) = Evt prio $ do
-  ref <- newRef []
-  (push, trigger) <- liftIO newPush
-  setupEventBuf ref push
-  listenToEvent parent prio (trigger . f) ref
-  return (eventPull ref, push)
+  (pullpush, trigger) <- newEventInit
+  listenToEvent parent prio (trigger . f) pullpush
+  return pullpush
 
 instance Functor Event where
   fmap f = transformEvent (map f)
@@ -261,7 +266,7 @@ generatorE :: Event (SignalGen a) -> SignalGen (Event a)
 generatorE evt = do
   here <- genLocation
   let prio = bottomPrio here
-  (result, trigger) <- newEvent prio
+  (result, trigger) <- newEventSG prio
   registerInit $ do
     clock <- getClock
     listenToEvent evt prio (handler here clock trigger) result
@@ -352,6 +357,13 @@ accumD initial evt@(~(Evt evtprio _)) = do
       oldVal <- get
       set $! foldl' (flip ($)) oldVal occs
 
+changesD :: Discrete a -> Event a
+changesD (Dis prio dis) = Evt prio $ do
+  (pull, push) <- dis
+  (pullpush, trigger) <- newEventInit
+  listenToPush push prio (trigger . (:[])) pullpush
+  return pullpush
+
 ----------------------------------------------------------------------
 -- events and signals
 
@@ -421,6 +433,19 @@ test1 = do
       getLine
     accD <- accumD "<zero>" $ append <$> signalToEvent strS
     return $ discreteToSignal accD
+  smp >>= print
+  smp >>= print
+  smp >>= print
+  where
+    append ch str = str ++ "/" ++ show ch
+
+test2 = do
+  smp <- start $ do
+    strS <- externalS $ do
+      putStrLn "input:"
+      getLine
+    accD <- accumD "<zero>" $ append <$> signalToEvent strS
+    return $ eventToSignal $ changesD accD
   smp >>= print
   smp >>= print
   smp >>= print
