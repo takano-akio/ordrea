@@ -10,6 +10,8 @@ import Data.IORef
 import Data.List
 import qualified Data.Map as M
 import Data.Maybe
+import Data.Monoid
+import Data.Ord (comparing)
 import qualified Data.Vector.Unboxed as U
 import Data.Word
 import System.Mem.Weak
@@ -37,7 +39,8 @@ data Priority = Priority
   { priLoc :: {-- UNPACK #-} !Location
   , priNum :: {-# UNPACK #-} !Int
   }
-  deriving (Eq, Ord) -- The default lexicographical ordering is appropriate
+  deriving (Eq, Ord, Show) -- The default lexicographical ordering is appropriate
+    -- Show is just for debugging
 
 nextPrio :: Priority -> Priority
 nextPrio prio@Priority{priNum=n} = prio{ priNum = n + 1 }
@@ -78,7 +81,7 @@ runSignalGen parentLoc clock (SignalGen gen) = do
       }
   result <- liftIO $ runReaderT gen genv
   (_, runAccumF) <- liftIO $ runInit parentLoc clock runAccumI
-  runAccumF
+  isolatingUpdates runAccumF
   return result
 
 genLocation :: SignalGen Location
@@ -128,20 +131,54 @@ runInit parentLoc clock i = do
 
 data REnv = REnv
   { envRegisterFini :: Consumer (Finalize ())
+  , envPendingUpdates :: IORef (M.Map Priority (Run ())) -- TODO: use heap?
   }
 
 runRun :: Run a -> IO a
 runRun run = do
   (registerF, runAccumF) <- liftIO newActionAccum
-  let renv = REnv { envRegisterFini = registerF }
-  result <- runReaderT run renv
+  pqueueRef <- newRef M.empty
+  let
+    renv = REnv
+      { envRegisterFini = registerF
+      , envPendingUpdates = pqueueRef
+      }
+  result <- runReaderT (run <* runUpdates) renv
   runAccumF
   return result
+
+runUpdates :: Run ()
+runUpdates = asks envPendingUpdates >>= loop
+  where
+    loop pqueueRef = do
+      pending <- readRef pqueueRef
+      case M.minView pending of
+        Nothing -> return ()
+        Just (upd, next) -> do
+          writeRef pqueueRef next
+          liftIO $ putStrLn $ "Running update"
+          upd
+          loop pqueueRef
 
 registerFini :: IO () -> Run ()
 registerFini fini = do
   reg <- asks envRegisterFini
   lift $ reg fini
+
+registerUpd :: Priority -> Run () -> Run ()
+registerUpd prio upd = do
+  pqueueRef <- asks envPendingUpdates
+  modifyRef pqueueRef $ M.insertWith' (>>) prio upd
+
+isolatingUpdates :: Run a -> Run a
+isolatingUpdates action = do
+  pqueueRef <- asks envPendingUpdates
+  pqueue <- readRef pqueueRef
+  writeRef pqueueRef M.empty
+  result <- action
+  runUpdates
+  writeRef pqueueRef pqueue
+  return result
 
 ----------------------------------------------------------------------
 -- push
@@ -190,6 +227,9 @@ pushFromOccPull prio occPull = do
   listenToPush clock prio trg push
   return push
 
+emptyPush :: Push a
+emptyPush _prio _weak = return ()
+
 ----------------------------------------------------------------------
 -- pull
 
@@ -215,6 +255,14 @@ newCachedPull gencalc = do
 
 ----------------------------------------------------------------------
 -- events
+
+instance Functor Event where
+  fmap f = transformEvent (map f)
+
+instance Monoid (Event a) where
+  mempty = emptyEvent
+  mappend x y = mergeEvents [x, y]
+  mconcat = mergeEvents
 
 listenToEvent :: Event a -> Priority -> ([a] -> Run ()) -> key -> Initialize ()
 listenToEvent (Evt evtPrio evt) prio handler key = do
@@ -259,9 +307,6 @@ transformEvent f parent@(Evt prio _) = Evt prio $ do
   listenToEvent parent prio (trigger . f) pullpush
   return pullpush
 
-instance Functor Event where
-  fmap f = transformEvent (map f)
-
 generatorE :: Event (SignalGen a) -> SignalGen (Event a)
 generatorE evt = do
   here <- genLocation
@@ -274,6 +319,31 @@ generatorE evt = do
   where
     handler here clock trigger gens =
       trigger =<< mapM (runSignalGen here clock) gens
+
+mergeEvents :: [Event a] -> Event a
+mergeEvents [] = emptyEvent
+mergeEvents evts = Evt prio $ do
+  (pullpush, trigger) <- newEventInit
+  occListRef <- newRef []
+  let
+    handler num occs = do
+      modifyRef occListRef ((num, occs):)
+      registerUpd prio upd
+    upd = do
+      occList <- readRef occListRef
+      liftIO $ putStrLn $ "upd; occList= " ++ show (map fst occList)
+      when (not $ null occList) $ do
+        writeRef occListRef []
+        trigger $ concatMap snd $ sortBy (comparing fst) occList
+  forM_ (zip [0..] evts) $ \(num, evt) ->
+    listenToEvent evt prio (handler num) pullpush
+  return pullpush
+  where
+    prio = maximum $ map evtPrio evts
+    evtPrio (Evt p _) = p
+
+emptyEvent :: Event a
+emptyEvent = Evt (bottomPrio bottomLocation) $ return (return [], emptyPush)
 
 ----------------------------------------------------------------------
 -- discretes
@@ -302,7 +372,7 @@ start gensig = do
         writeRef ref getval
     readRef ref
   return $ runRun $ do
-    clockTrigger ()
+    isolatingUpdates $ clockTrigger ()
     getval
 
 externalS :: IO a -> SignalGen (Signal a)
@@ -446,6 +516,19 @@ test2 = do
       getLine
     accD <- accumD "<zero>" $ append <$> signalToEvent strS
     return $ eventToSignal $ changesD accD
+  smp >>= print
+  smp >>= print
+  smp >>= print
+  where
+    append ch str = str ++ "/" ++ show ch
+
+test3 = do
+  smp <- start $ do
+    strS <- externalS $ do
+      putStrLn "input:"
+      getLine
+    accD <- accumD "<zero>" $ append <$> signalToEvent strS
+    return $ eventToSignal $ changesD accD `mappend` (signalToEvent $ (:[]) <$> strS)
   smp >>= print
   smp >>= print
   smp >>= print
