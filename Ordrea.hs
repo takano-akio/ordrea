@@ -1,4 +1,4 @@
-{-# LANGUAGE DeriveFunctor, GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE DeriveFunctor, GeneralizedNewtypeDeriving, ExistentialQuantification #-}
 module Ordrea where
 
 import Control.Applicative
@@ -14,7 +14,10 @@ import Data.Monoid
 import Data.Ord (comparing)
 import qualified Data.Vector.Unboxed as U
 import Data.Word
+import System.Mem (performGC)
 import System.Mem.Weak
+
+import Weak
 
 newtype SignalGen a = SignalGen (ReaderT GEnv IO a)
   deriving (Monad, Functor, Applicative, MonadIO)
@@ -61,6 +64,14 @@ newLocationGen parentLoc = do
     num <- readRef counter
     writeRef counter $! num + 1
     return $! parentLoc `U.snoc` num
+
+----------------------------------------------------------------------
+-- weak pointers
+
+data WeakKey = forall a. WeakKey {-# UNPACK #-} !(IORef a)
+
+mkWeakWithKey :: WeakKey -> v -> IO (Weak v)
+mkWeakWithKey (WeakKey ref) v = mkWeakWithIORef ref v Nothing
 
 ----------------------------------------------------------------------
 -- SignalGen monad
@@ -156,7 +167,6 @@ runUpdates = asks envPendingUpdates >>= loop
         Nothing -> return ()
         Just (upd, next) -> do
           writeRef pqueueRef next
-          liftIO $ putStrLn $ "Running update"
           upd
           loop pqueueRef
 
@@ -185,9 +195,9 @@ isolatingUpdates action = do
 
 type Notifier = Priority -> Weak (Run ()) -> IO ()
 
-listenToNotifier :: Notifier -> Priority -> (Run ()) -> key -> Initialize ()
-listenToNotifier push prio handler key = do
-  weak <- liftIO $ mkWeak key handler Nothing
+listenToNotifier :: WeakKey -> Notifier -> Priority -> (Run ()) -> Initialize ()
+listenToNotifier key push prio handler = do
+  weak <- liftIO $ mkWeakWithKey key handler
   liftIO $ push prio weak
 
 newNotifier :: IO (Notifier, Run ())
@@ -215,17 +225,6 @@ newNotifier = do
               listener
               return $ Just weak
             Nothing -> return Nothing
-
-pushFromOccPull :: Priority -> Pull [a] -> Initialize Notifier
-pushFromOccPull prio occPull = do
-  (push, trigger) <- liftIO newNotifier
-  clock <- getClock
-  let
-    trg = do
-      occs <- occPull
-      when (not $ null occs) trigger
-  listenToNotifier clock prio trg push
-  return push
 
 emptyNotifier :: Notifier
 emptyNotifier _prio _weak = return ()
@@ -264,11 +263,10 @@ instance Monoid (Event a) where
   mappend x y = mergeEvents [x, y]
   mconcat = mergeEvents
 
-listenToEvent :: Event a -> Priority -> ([a] -> Run ()) -> key -> Initialize ()
-listenToEvent (Evt evtPrio evt) prio handler key = do
+listenToEvent :: WeakKey -> Event a -> Priority -> ([a] -> Run ()) -> Initialize ()
+listenToEvent key (Evt evtPrio evt) prio handler = do
   (evtPull, evtNot) <- evt
-  let hdl = handler =<< evtPull
-  listenToNotifier evtNot prio hdl key
+  listenToNotifier key evtNot prio $ handler =<< evtPull
   parLoc <- getParentLocation
   when (priLoc evtPrio < parLoc) $
     registerFirstStep $ do
@@ -276,18 +274,18 @@ listenToEvent (Evt evtPrio evt) prio handler key = do
       when (not $ null initialOccs) $
         handler initialOccs
 
-newEventSG :: Priority -> SignalGen (Event a, [a] -> Run ())
+newEventSG :: Priority -> SignalGen (Event a, [a] -> Run (), WeakKey)
 newEventSG prio = do
   ref <- newRef []
   (push, trigger) <- liftIO newNotifier
   let evt = Evt prio $ return (eventPull ref, push)
-  return (evt, eventTrigger ref trigger)
+  return (evt, eventTrigger ref trigger, WeakKey ref)
 
-newEventInit :: Initialize ((Pull [a], Notifier), [a] -> Run ())
+newEventInit :: Initialize ((Pull [a], Notifier), [a] -> Run (), WeakKey)
 newEventInit = do
   ref <- newRef []
   (push, trigger) <- liftIO newNotifier
-  return ((eventPull ref, push), eventTrigger ref trigger)
+  return ((eventPull ref, push), eventTrigger ref trigger, WeakKey ref)
 
 eventPull :: IORef [a] -> Pull [a]
 eventPull buf = readRef buf
@@ -300,12 +298,11 @@ eventTrigger buf notify occs = do
 
 transformEvent :: ([a] -> [b]) -> Event a -> Event b
 transformEvent f parent@(Evt prio _) = Evt prio $ do
-  (pullpush, trigger) <- newEventInit
-  listenToEvent parent prio (ifNotNull trigger . f) pullpush
+  (pullpush, trigger, key) <- newEventInit
+  listenToEvent key parent prio $ \xs -> case f xs of
+    [] -> return ()
+    ys -> trigger ys
   return pullpush
-  where
-    ifNotNull _ [] = return ()
-    ifNotNull trigger xs = trigger xs
 
 transformEvent1 :: ([a] -> [b]{-non-empty-}) -> Event a -> Event b
 transformEvent1 f (Evt prio evt) = Evt prio $ do
@@ -316,32 +313,28 @@ generatorE :: Event (SignalGen a) -> SignalGen (Event a)
 generatorE evt = do
   here <- genLocation
   let prio = bottomPrio here
-  (result, trigger) <- newEventSG prio
+  (result, trigger, key) <- newEventSG prio
   registerInit $ do
     clock <- getClock
-    listenToEvent evt prio (handler here clock trigger) result
-  return $ result
-  where
-    handler here clock trigger gens =
+    listenToEvent key evt prio $ \gens ->
       trigger =<< mapM (runSignalGen here clock) gens
+  return $ result
 
 mergeEvents :: [Event a] -> Event a
 mergeEvents [] = emptyEvent
 mergeEvents evts = Evt prio $ do
-  (pullpush, trigger) <- newEventInit
+  (pullpush, trigger, key) <- newEventInit
   occListRef <- newRef []
   let
-    handler num occs = do
-      modifyRef occListRef ((num, occs):)
-      registerUpd prio upd
     upd = do
       occList <- readRef occListRef
-      liftIO $ putStrLn $ "upd; occList= " ++ show (map fst occList)
       when (not $ null occList) $ do
         writeRef occListRef []
         trigger $ concatMap snd $ sortBy (comparing fst) occList
   forM_ (zip [0..] evts) $ \(num, evt) ->
-    listenToEvent evt prio (handler num) pullpush
+    listenToEvent key evt prio $ \occs -> do
+      modifyRef occListRef ((num, occs):)
+      registerUpd prio upd
   return pullpush
   where
     prio = maximum $ map evtPrio evts
@@ -353,12 +346,12 @@ emptyEvent = Evt (bottomPrio bottomLocation) $ return (return [], emptyNotifier)
 ----------------------------------------------------------------------
 -- discretes
 
-newDiscrete :: a -> Priority -> SignalGen (Discrete a, Run a, a -> Run ())
+newDiscrete :: a -> Priority -> SignalGen (Discrete a, Run a, a -> Run (), WeakKey)
 newDiscrete initial prio = do
   ref <- newRef initial
   (push, trigger) <- liftIO newNotifier
   let dis = Dis prio $ return (readRef ref, push)
-  return (dis, readRef ref, discreteTrigger ref trigger)
+  return (dis, readRef ref, discreteTrigger ref trigger, WeakKey ref)
 
 discreteTrigger :: IORef a -> Run () -> a -> Run ()
 discreteTrigger buf notify val = do
@@ -422,12 +415,11 @@ delayS initial ~(Sig _sigprio sig) = do
   registerInit $ do
     clock <- getClock
     pull <- sig
-    listenToNotifier clock prio (upd ref pull) ref
-  return $ Sig prio $ return $ readRef ref
-  where
-    upd ref pull = do
+    listenToNotifier (WeakKey ref) clock prio $ do
       newVal <- pull
       registerFini $ writeRef ref newVal
+  return $ Sig prio $ return $ readRef ref
+  where
     prio = bottomPrio bottomLocation
 
 instance Functor Signal where
@@ -438,15 +430,13 @@ instance Functor Signal where
 
 accumD :: a -> Event (a -> a) -> SignalGen (Discrete a)
 accumD initial evt@(~(Evt evtprio _)) = do
-  (dis, get, set) <- newDiscrete initial prio
-  registerInit $
-    listenToEvent evt prio (upd get set) dis
+  (dis, get, set, key) <- newDiscrete initial prio
+  registerInit $ listenToEvent key evt prio $ \occs -> do
+    oldVal <- get
+    set $! foldl' (flip ($)) oldVal occs
   return dis
   where
     prio = nextPrio evtprio
-    upd get set occs = do
-      oldVal <- get
-      set $! foldl' (flip ($)) oldVal occs
 
 changesD :: Discrete a -> Event a
 changesD (Dis prio dis) = Evt prio $ do
@@ -463,9 +453,17 @@ eventToSignal (Evt prio evt) = Sig prio $ do
 
 signalToEvent :: Signal [a] -> Event a
 signalToEvent (Sig sigprio sig) = Evt prio $ do
-  pull <- sig
-  push <- pushFromOccPull prio pull
-  return (pull, push)
+  sigpull <- sig
+  (pullpush, trigger, key) <- newEventInit
+    -- ^ Here we create a fresh event, even though its pull component
+    -- will be identical to sigpull. This is because we want a new key
+    -- to keep the new notifier alive as long as the new pull, rather
+    -- than the original pull, is alive.
+  clock <- getClock
+  listenToNotifier key clock prio $ do
+    occs <- sigpull
+    when (not $ null occs) $ trigger occs
+  return pullpush
   where
     prio = nextPrio sigprio
 
@@ -548,9 +546,10 @@ test3 = do
       getLine
     accD <- accumD "<zero>" $ append <$> signalToEvent strS
     return $ eventToSignal $ changesD accD `mappend` (signalToEvent $ (:[]) <$> strS)
-  smp >>= print
-  smp >>= print
-  smp >>= print
+  let go = performGC >> smp >>= print
+  go
+  go
+  go
   where
     append ch str = str ++ "/" ++ show ch
 
