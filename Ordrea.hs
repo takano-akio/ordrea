@@ -257,7 +257,7 @@ newCachedPull gencalc = do
 -- events
 
 instance Functor Event where
-  fmap f = transformEvent (map f)
+  fmap f = transformEvent1 (map f)
 
 instance Monoid (Event a) where
   mempty = emptyEvent
@@ -301,8 +301,16 @@ eventTrigger buf notify occs = do
 transformEvent :: ([a] -> [b]) -> Event a -> Event b
 transformEvent f parent@(Evt prio _) = Evt prio $ do
   (pullpush, trigger) <- newEventInit
-  listenToEvent parent prio (trigger . f) pullpush
+  listenToEvent parent prio (ifNotNull trigger . f) pullpush
   return pullpush
+  where
+    ifNotNull _ [] = return ()
+    ifNotNull trigger xs = trigger xs
+
+transformEvent1 :: ([a] -> [b]{-non-empty-}) -> Event a -> Event b
+transformEvent1 f (Evt prio evt) = Evt prio $ do
+  (pull, notifier) <- evt
+  return (f <$> pull, notifier)
 
 generatorE :: Event (SignalGen a) -> SignalGen (Event a)
 generatorE evt = do
