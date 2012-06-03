@@ -1,4 +1,5 @@
 {-# LANGUAGE MagicHash, UnboxedTuples #-}
+{-# OPTIONS_GHC -Wall #-}
 
 -- WARNING
 -- This file causes a segfault if interpreted with ghci.

@@ -1,4 +1,5 @@
 {-# LANGUAGE DeriveFunctor, GeneralizedNewtypeDeriving, ExistentialQuantification #-}
+{-# OPTIONS_GHC -Wall #-}
 module Ordrea where
 
 import Control.Applicative
@@ -115,9 +116,9 @@ data IEnv = IEnv
   }
 
 registerFirstStep :: Run () -> Initialize ()
-registerFirstStep fst = do
+registerFirstStep action = do
   reg <- asks envRegisterFirstStep
-  lift $ reg fst
+  lift $ reg action
 
 getClock :: Initialize Notifier
 getClock = asks envClock
@@ -167,7 +168,7 @@ runUpdates = asks envPendingUpdates >>= loop
         Nothing -> return ()
         Just (upd, next) -> do
           writeRef pqueueRef next
-          upd
+          upd :: Run ()
           loop pqueueRef
 
 registerFini :: IO () -> Run ()
@@ -222,7 +223,7 @@ newNotifier = do
           m <- liftIO $ deRefWeak weak
           case m of
             Just listener -> do
-              listener
+              listener :: Run ()
               return $ Just weak
             Nothing -> return Nothing
 
@@ -331,7 +332,7 @@ mergeEvents evts = Evt prio $ do
       when (not $ null occList) $ do
         writeRef occListRef []
         trigger $ concatMap snd $ sortBy (comparing fst) occList
-  forM_ (zip [0..] evts) $ \(num, evt) ->
+  forM_ (zip [0::Int ..] evts) $ \(num, evt) ->
     listenToEvent key evt prio $ \occs -> do
       modifyRef occListRef ((num, occs):)
       registerUpd prio upd
