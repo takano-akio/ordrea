@@ -15,6 +15,8 @@ import Data.Monoid
 import Data.Ord (comparing)
 import qualified Data.Vector.Unboxed as U
 import Data.Word
+import Debug.Trace
+import System.IO.Unsafe
 import System.Mem (performGC)
 import System.Mem.Weak
 
@@ -258,6 +260,75 @@ newCachedPull gencalc = do
             return val
 
 ----------------------------------------------------------------------
+-- common push-pull operations
+
+unsafeOnce :: Initialize a -> Initialize a
+unsafeOnce = unsafeCache
+
+unsafeProtectFromDup :: (a -> Initialize a) -> Initialize a -> Initialize a
+unsafeProtectFromDup protect base = unsafeCache (base >>= protect)
+
+unsafeCache :: Initialize a -> Initialize a
+unsafeCache action = do
+  cache <- readRef cacheRef
+  case cache of
+    Just val -> return val
+    Nothing -> do
+      val <- action
+      writeRef cacheRef (Just val)
+      return val
+  where
+    cacheRef = unsafeDupablePerformIO $ newIORef (const' Nothing action)
+{-# NOINLINE unsafeCache #-}
+
+-- | Non-inlinable version of const, only useful to prevent optimization.
+const' :: a -> b -> a
+const' x _ = x
+{-# NOINLINE const' #-}
+
+transparentMemo
+  :: Location
+  -> Priority
+  -> Initialize (Pull a, Notifier)
+  -> Initialize (Pull a, Notifier)
+transparentMemo srcLoc prio orig = unsafeProtectFromDup (primMemo srcLoc prio) orig
+
+primMemo :: Location -> Priority -> (Pull a, Notifier)
+  -> Initialize (Pull a, Notifier)
+primMemo srcLoc prio (pull, notifier) = do
+  cacheRef <- newRef Nothing
+  listenToPullPush (WeakKey cacheRef) pull notifier srcLoc prio $ \val -> do
+    debug $ "primMemo: writing to cache: prio=" ++ show prio
+    writeRef cacheRef $ Just val
+  let
+    readCache = do
+      debug $ "primMemo: reading from cache"
+      cache <- readRef cacheRef
+      case cache of
+        Just val -> return val
+        Nothing -> do
+          val <- pull
+          writeRef cacheRef $ Just val
+          return val
+  return (readCache, notifier)
+{-# NOINLINE primMemo #-} -- useful for debugging
+
+listenToPullPush
+  :: WeakKey
+  -> Pull a
+  -> Notifier
+  -> Location
+  -> Priority
+  -> (a -> Run ())
+  -> Initialize ()
+listenToPullPush key pull notifier srcLoc prio handler = do
+  listenToNotifier key notifier prio $ handler =<< pull
+  parLoc <- getParentLocation
+  when (srcLoc < parLoc) $ do
+    debug $ "listenToPullPush: immediate trigger"
+    registerFirstStep $ handler =<< pull
+
+----------------------------------------------------------------------
 -- events
 
 instance Functor Event where
@@ -271,13 +342,8 @@ instance Monoid (Event a) where
 listenToEvent :: WeakKey -> Event a -> Priority -> ([a] -> Run ()) -> Initialize ()
 listenToEvent key (Evt evtPrio evt) prio handler = do
   (evtPull, evtNot) <- evt
-  listenToNotifier key evtNot prio $ handler =<< evtPull
-  parLoc <- getParentLocation
-  when (priLoc evtPrio < parLoc) $
-    registerFirstStep $ do
-      initialOccs <- evtPull
-      when (not $ null initialOccs) $
-        handler initialOccs
+  listenToPullPush key evtPull evtNot (priLoc evtPrio) prio $ \occs ->
+    when (not $ null occs) $ handler occs
 
 newEventSG :: Priority -> SignalGen (Event a, [a] -> Run (), WeakKey)
 newEventSG prio = do
@@ -310,9 +376,12 @@ transformEvent f parent@(Evt prio _) = Evt prio $ do
   return pullpush
 
 transformEvent1 :: ([a] -> [b]{-non-empty-}) -> Event a -> Event b
-transformEvent1 f (Evt prio evt) = Evt prio $ do
+transformEvent1 f (Evt evprio evt) = Evt prio $ transparentMemo (priLoc evprio) memoprio $ do
   (pull, notifier) <- evt
   return (f <$> pull, notifier)
+  where
+    memoprio = nextPrio evprio
+    prio = nextPrio memoprio
 
 generatorE :: Event (SignalGen a) -> SignalGen (Event a)
 generatorE evt = do
@@ -333,11 +402,13 @@ mergeEvents evts = Evt prio $ do
   let
     upd = do
       occList <- readRef occListRef
+      debug $ "mergeEvents: upd: prio=" ++ show prio ++ "; total occs=" ++ show (length $ concatMap snd occList)
       when (not $ null occList) $ do
         writeRef occListRef []
         trigger $ concatMap snd $ sortBy (comparing fst) occList
   forM_ (zip [0::Int ..] evts) $ \(num, evt) ->
     listenToEvent key evt prio $ \occs -> do
+      debug $ "mergeEvents: listen: noccs=" ++ show (length occs)
       modifyRef occListRef ((num, occs):)
       registerUpd prio upd
   return pullpush
@@ -458,6 +529,7 @@ eventToSignal (Evt prio evt) = Sig prio $ do
 
 signalToEvent :: Signal [a] -> Event a
 signalToEvent (Sig sigprio sig) = Evt prio $ do
+  debug "signalToEvent"
   sigpull <- sig
   (pullpush, trigger, key) <- newEventInit
     -- ^ Here we create a fresh event, even though its pull component
@@ -467,6 +539,7 @@ signalToEvent (Sig sigprio sig) = Evt prio $ do
   clock <- getClock
   listenToNotifier key clock prio $ do
     occs <- sigpull
+    debug $ "signalToEvent: onclock prio=" ++ show prio ++ "; noccs=" ++ show (length occs)
     when (not $ null occs) $ trigger occs
   return pullpush
   where
@@ -503,6 +576,12 @@ newActionAccum = do
   where
     add ref act = modifyIORef ref (act:)
     run ref = readRef ref >>= sequence_
+
+debug :: (MonadIO m) => String -> m ()
+debug str = when debugTraceEnabled $ liftIO $ putStrLn str
+
+debugTraceEnabled :: Bool
+debugTraceEnabled = False
 
 ----------------------------------------------------------------------
 -- tests
@@ -557,5 +636,20 @@ test3 = do
   go
   where
     append ch str = str ++ "/" ++ show ch
+
+test4 = do
+  smp <- start $ do
+    strS <- externalS $ do
+      putStrLn "input:"
+      getLine
+    let lenE = mysucc <$> signalToEvent strS
+    return $ eventToSignal $ lenE `mappend` lenE
+  let go = performGC >> smp >>= print
+  go
+  go
+  go
+  where
+    append ch str = str ++ "/" ++ show ch
+    mysucc c = trace ("mysucc: " ++ show c) (succ c)
 
 -- vim: sw=2 ts=2 sts=2
