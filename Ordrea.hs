@@ -296,20 +296,14 @@ transparentMemo srcLoc prio orig = unsafeProtectFromDup (primMemo srcLoc prio) o
 primMemo :: Location -> Priority -> (Pull a, Notifier)
   -> Initialize (Pull a, Notifier)
 primMemo srcLoc prio (pull, notifier) = do
-  cacheRef <- newRef Nothing
+  cacheRef <- newRef $ error "primMemo: cache not initialized"
   listenToPullPush (WeakKey cacheRef) pull notifier srcLoc prio $ \val -> do
     debug $ "primMemo: writing to cache: prio=" ++ show prio
-    writeRef cacheRef $ Just val
+    writeRef cacheRef val
   let
     readCache = do
       debug $ "primMemo: reading from cache"
-      cache <- readRef cacheRef
-      case cache of
-        Just val -> return val
-        Nothing -> do
-          val <- pull
-          writeRef cacheRef $ Just val
-          return val
+      readRef cacheRef
   return (readCache, notifier)
 {-# NOINLINE primMemo #-} -- useful for debugging
 
