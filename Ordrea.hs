@@ -368,12 +368,15 @@ eventTrigger buf notify occs = do
   notify
 
 transformEvent :: ([a] -> [b]) -> Event a -> Event b
-transformEvent f parent@(Evt prio _) = Evt prio $ do
+transformEvent f parent@(Evt evprio _) = Evt prio $ transparentMemo (priLoc evprio) memoprio $ do
   (pullpush, trigger, key) <- newEventInit
   listenToEvent key parent prio $ \xs -> case f xs of
     [] -> return ()
     ys -> trigger ys
   return pullpush
+  where
+    memoprio = nextPrio evprio
+    prio = nextPrio memoprio
 
 transformEvent1 :: ([a] -> [b]{-non-empty-}) -> Event a -> Event b
 transformEvent1 f (Evt evprio evt) = Evt prio $ transparentMemo (priLoc evprio) memoprio $ do
@@ -396,7 +399,7 @@ generatorE evt = do
 
 mergeEvents :: [Event a] -> Event a
 mergeEvents [] = emptyEvent
-mergeEvents evts = Evt prio $ do
+mergeEvents evts = Evt prio $ unsafeOnce $ do
   (pullpush, trigger, key) <- newEventInit
   occListRef <- newRef []
   let
@@ -528,7 +531,7 @@ eventToSignal (Evt prio evt) = Sig prio $ do
   return pull
 
 signalToEvent :: Signal [a] -> Event a
-signalToEvent (Sig sigprio sig) = Evt prio $ do
+signalToEvent (Sig sigprio sig) = Evt prio $ unsafeCache $ do
   debug "signalToEvent"
   sigpull <- sig
   (pullpush, trigger, key) <- newEventInit
@@ -651,5 +654,19 @@ test4 = do
   where
     append ch str = str ++ "/" ++ show ch
     mysucc c = trace ("mysucc: " ++ show c) (succ c)
+
+test5 = do
+  smp <- start $ do
+    strS <- externalS $ do
+      putStrLn "input:"
+      getLine
+    let lenE = signalToEvent strS
+    return $ eventToSignal $ lenE `mappend` lenE
+  let go = performGC >> smp >>= print
+  go
+  go
+  go
+  where
+    append ch str = str ++ "/" ++ show ch
 
 -- vim: sw=2 ts=2 sts=2
