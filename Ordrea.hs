@@ -43,8 +43,12 @@ data Priority = Priority
   { priLoc :: {-- UNPACK #-} !Location
   , priNum :: {-# UNPACK #-} !Int
   }
-  deriving (Eq, Ord, Show) -- The default lexicographical ordering is appropriate
-    -- Show is just for debugging
+  deriving (Eq, Ord) -- The default lexicographical ordering is appropriate
+
+-- just for debugging
+instance Show Priority where
+  show Priority{priLoc = loc, priNum = num} =
+    show (U.toList loc) ++ "/" ++ show num
 
 nextPrio :: Priority -> Priority
 nextPrio prio@Priority{priNum=n} = prio{ priNum = n + 1 }
