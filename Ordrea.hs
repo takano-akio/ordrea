@@ -419,8 +419,21 @@ emptyEvent = Evt (bottomPrio bottomLocation) $ return (return [], emptyNotifier)
 ----------------------------------------------------------------------
 -- discretes
 
-newDiscrete :: a -> Priority -> SignalGen (Discrete a, Run a, a -> Run (), WeakKey)
-newDiscrete initial prio = do
+instance Functor Discrete where
+  fmap = mapDiscrete
+
+instance Applicative Discrete where
+  pure = pureDiscrete
+  (<*>) = apDiscrete
+
+newDiscreteInit :: a -> Initialize ((Pull a, Notifier), a -> Run (), WeakKey)
+newDiscreteInit initial = do
+  ref <- newRef initial
+  (push, trigger) <- liftIO newNotifier
+  return ((readRef ref, push), discreteTrigger ref trigger, WeakKey ref)
+
+newDiscreteSG :: a -> Priority -> SignalGen (Discrete a, Run a, a -> Run (), WeakKey)
+newDiscreteSG initial prio = do
   ref <- newRef initial
   (push, trigger) <- liftIO newNotifier
   let dis = Dis prio $ return (readRef ref, push)
@@ -431,18 +444,45 @@ discreteTrigger buf notify val = do
   writeRef buf val
   notify
 
-{-
-listenToDiscrete :: Discrete a -> Priority -> (a -> Run ()) -> key -> Initialize ()
-listenToDiscrete (Dis disPrio dis) prio handler key = do
+mapDiscrete :: (a -> b) -> Discrete a -> Discrete b
+mapDiscrete f (Dis dprio dis) = Dis prio $ transparentMemo (priLoc dprio) memoprio $ do
+  (pull, notifier) <- dis
+  return (f <$> pull, notifier)
+  where
+    prio = nextPrio memoprio
+    memoprio = nextPrio dprio
+
+pureDiscrete :: a -> Discrete a
+pureDiscrete value = Dis (bottomPrio bottomLocation) $
+  return (pure value, emptyNotifier)
+
+apDiscrete :: Discrete (a -> b) -> Discrete a -> Discrete b
+-- both arguments must have been memoized
+apDiscrete (Dis fprio fun) (Dis aprio arg)
+    = Dis prio $ transparentMemo (priLoc srcprio) memoprio $ do
+  dirtyRef <- newRef False
+  (pullpush, set, key) <- newDiscreteInit (error "apDiscrete: uninitialized")
+  (funPull, funNot) <- fun
+  (argPull, argNot) <- arg
+  let
+    upd = do
+      dirty <- readRef dirtyRef
+      when dirty $ do
+        writeRef dirtyRef False
+        set =<< funPull <*> argPull
+  let handler = writeRef dirtyRef True >> registerUpd prio upd
+  listenToNotifier key funNot prio handler
+  listenToNotifier key argNot prio handler
+  return pullpush
+  where
+    srcprio = max fprio aprio
+    memoprio = nextPrio srcprio
+    prio = nextPrio memoprio
+
+listenToDiscrete :: WeakKey -> Discrete a -> Priority -> (a -> Run ()) -> Initialize ()
+listenToDiscrete key (Dis disPrio dis) prio handler = do
   (disPull, disNot) <- dis
-  let hdl = handler =<< disPull
-  listenToNotifier evtNot prio hdl key
-  parLoc <- getParentLocation
-  when (priLoc evtPrio < parLoc) $
-    registerFirstStep $ do
-      initialOccs <- disPull
-      handler initialOccs
--}
+  listenToPullPush key disPull disNot (priLoc disPrio) prio handler
 
 ----------------------------------------------------------------------
 -- signals
@@ -503,7 +543,7 @@ instance Functor Signal where
 
 accumD :: a -> Event (a -> a) -> SignalGen (Discrete a)
 accumD initial evt@(~(Evt evtprio _)) = do
-  (dis, get, set, key) <- newDiscrete initial prio
+  (dis, get, set, key) <- newDiscreteSG initial prio
   registerInit $ listenToEvent key evt prio $ \occs -> do
     oldVal <- get
     set $! foldl' (flip ($)) oldVal occs
@@ -646,7 +686,6 @@ test4 = do
   go
   go
   where
-    append ch str = str ++ "/" ++ show ch
     mysucc c = trace ("mysucc: " ++ show c) (succ c)
 
 test5 = do
@@ -660,7 +699,5 @@ test5 = do
   go
   go
   go
-  where
-    append ch str = str ++ "/" ++ show ch
 
 -- vim: sw=2 ts=2 sts=2
