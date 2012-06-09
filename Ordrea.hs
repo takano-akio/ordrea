@@ -7,6 +7,7 @@ import Control.Monad
 import Control.Monad.IO.Class
 import Control.Monad.Trans.Class
 import Control.Monad.Trans.Reader
+import qualified Data.Char as Char
 import Data.IORef
 import Data.List
 import qualified Data.Map as M
@@ -416,6 +417,9 @@ mergeEvents evts = Evt prio $ unsafeOnce $ do
 emptyEvent :: Event a
 emptyEvent = Evt (bottomPrio bottomLocation) $ return (return [], emptyNotifier)
 
+filterE :: (a -> Bool) -> Event a -> Event a
+filterE p = transformEvent (filter p)
+
 ----------------------------------------------------------------------
 -- discretes
 
@@ -694,6 +698,18 @@ test5 = do
       putStrLn "input:"
       getLine
     let lenE = signalToEvent strS
+    return $ eventToSignal $ lenE `mappend` lenE
+  let go = performGC >> smp >>= print
+  go
+  go
+  go
+
+test6 = do
+  smp <- start $ do
+    strS <- externalS $ do
+      putStrLn "input:"
+      getLine
+    let lenE = filterE Char.isUpper $ signalToEvent strS
     return $ eventToSignal $ lenE `mappend` lenE
   let go = performGC >> smp >>= print
   go
