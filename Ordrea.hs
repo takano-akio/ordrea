@@ -425,6 +425,23 @@ stepClockE = Evt (bottomPrio bottomLocation) $ do
   clock <- getClock
   return (pure [()], clock)
 
+dropStepE :: Event a -> SignalGen (Event a)
+dropStepE evt@(Evt evtprio _) = do
+  clockKey <- WeakKey <$> newRef ()
+  clockKeyRef <- newRef (Just clockKey)
+  (result, trigger, key) <- newEventSG prio
+
+  registerInit $ do
+    clock <- getClock
+    listenToNotifier clockKey clock prio $ writeRef clockKeyRef Nothing
+    listenToEvent key evt prio $ \occs -> do
+      firstStep <- isJust <$> readRef clockKeyRef
+      when (not firstStep) $ trigger occs
+
+  return result
+  where
+    prio = nextPrio evtprio
+
 ----------------------------------------------------------------------
 -- discretes
 
@@ -715,6 +732,18 @@ test6 = do
       putStrLn "input:"
       getLine
     let lenE = filterE Char.isUpper $ signalToEvent strS
+    return $ eventToSignal $ lenE `mappend` lenE
+  let go = performGC >> smp >>= print
+  go
+  go
+  go
+
+test7 = do
+  smp <- start $ do
+    strS <- externalS $ do
+      putStrLn "input:"
+      getLine
+    lenE <- dropStepE $ signalToEvent strS
     return $ eventToSignal $ lenE `mappend` lenE
   let go = performGC >> smp >>= print
   go
