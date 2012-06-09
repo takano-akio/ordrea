@@ -420,6 +420,11 @@ emptyEvent = Evt (bottomPrio bottomLocation) $ return (return [], emptyNotifier)
 filterE :: (a -> Bool) -> Event a -> Event a
 filterE p = transformEvent (filter p)
 
+stepClockE :: Event ()
+stepClockE = Evt (bottomPrio bottomLocation) $ do
+  clock <- getClock
+  return (pure [()], clock)
+
 ----------------------------------------------------------------------
 -- discretes
 
