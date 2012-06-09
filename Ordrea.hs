@@ -491,6 +491,9 @@ listenToDiscrete key (Dis disPrio dis) prio handler = do
 ----------------------------------------------------------------------
 -- signals
 
+instance Functor Signal where
+  fmap f (Sig prio pull) = Sig prio (fmap f <$> pull) -- TODO: memoize
+
 start :: SignalGen (Signal a) -> IO (IO a)
 start gensig = do
   (clock, clockTrigger) <- newNotifier
@@ -538,9 +541,6 @@ delayS initial ~(Sig _sigprio sig) = do
   return $ Sig prio $ return $ readRef ref
   where
     prio = bottomPrio bottomLocation
-
-instance Functor Signal where
-  fmap f (Sig prio pull) = Sig prio (fmap f <$> pull)
 
 ----------------------------------------------------------------------
 -- events and discretes
