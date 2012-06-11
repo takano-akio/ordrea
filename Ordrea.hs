@@ -317,11 +317,10 @@ listenToPullPush
   -> (a -> Run ())
   -> Initialize ()
 listenToPullPush key pull notifier srcLoc prio handler = do
+  registerFirstStep $ registerUpd prio $ handler =<< pull
+    -- ^ use pull for the first step
   listenToNotifier key notifier prio $ handler =<< pull
-  parLoc <- getParentLocation
-  when (srcLoc < parLoc) $ do
-    debug $ "listenToPullPush: immediate trigger"
-    registerFirstStep $ handler =<< pull
+    -- ^ use push for the subsequent steps
 
 ----------------------------------------------------------------------
 -- events
