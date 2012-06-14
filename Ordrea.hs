@@ -563,6 +563,15 @@ delayS initial ~(Sig _sigprio sig) = do
   where
     prio = bottomPrio bottomLocation
 
+signalFromList :: [a] -> SignalGen (Signal a)
+signalFromList xs = do
+  clock@(Evt clockPrio _) <- dropStepE stepClockE
+  suffixD@(Dis suffixPrio _) <- accumD xs $ drop 1 <$ clock
+  return $ discreteToSignal $ hd <$> suffixD
+  where
+    hd = fromMaybe (error "listToSignal: list exhausted") .
+      listToMaybe
+
 ----------------------------------------------------------------------
 -- events and discretes
 
