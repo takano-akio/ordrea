@@ -439,6 +439,9 @@ dropStepE evt@(Evt evtprio _) = do
   where
     prio = nextPrio evtprio
 
+eventFromList :: [[a]] -> SignalGen (Event a)
+eventFromList occs = signalToEvent <$> signalFromList (occs ++ repeat [])
+
 ----------------------------------------------------------------------
 -- discretes
 
@@ -679,6 +682,7 @@ _unitTest = runTestTT $ test
   , test_filterE
   , test_dropStepE
   , test_apDiscrete
+  , test_eventFromList
   ]
   where
     test_signalFromList = do
@@ -751,5 +755,11 @@ _unitTest = runTestTT $ test
         let dis = (*) <$> dis0 <*> dis1
         return $ eventToSignal $ changesD dis
       r @?= [[0], [4], [], [15]]
+
+    test_eventFromList = do
+      r <- networkToListGC 3 $ do
+        ev <- eventFromList [[2::Int], [], [3,4]]
+        return $ eventToSignal ev
+      r @?= [[2], [], [3,4]]
 
 -- vim: sw=2 ts=2 sts=2
