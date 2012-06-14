@@ -288,17 +288,16 @@ const' x _ = x
 {-# NOINLINE const' #-}
 
 transparentMemo
-  :: Location
-  -> Priority
+  :: Priority
   -> Initialize (Pull a, Notifier)
   -> Initialize (Pull a, Notifier)
-transparentMemo srcLoc prio orig = unsafeProtectFromDup (primMemo srcLoc prio) orig
+transparentMemo prio orig = unsafeProtectFromDup (primMemo prio) orig
 
-primMemo :: Location -> Priority -> (Pull a, Notifier)
+primMemo :: Priority -> (Pull a, Notifier)
   -> Initialize (Pull a, Notifier)
-primMemo srcLoc prio (pull, notifier) = do
+primMemo prio (pull, notifier) = do
   cacheRef <- newRef $ error "primMemo: cache not initialized"
-  listenToPullPush (WeakKey cacheRef) pull notifier srcLoc prio $ \val -> do
+  listenToPullPush (WeakKey cacheRef) pull notifier prio $ \val -> do
     debug $ "primMemo: writing to cache: prio=" ++ show prio
     writeRef cacheRef val
   let
@@ -312,11 +311,10 @@ listenToPullPush
   :: WeakKey
   -> Pull a
   -> Notifier
-  -> Location
   -> Priority
   -> (a -> Run ())
   -> Initialize ()
-listenToPullPush key pull notifier srcLoc prio handler = do
+listenToPullPush key pull notifier prio handler = do
   registerFirstStep $ registerUpd prio $ handler =<< pull
     -- ^ use pull for the first step
   listenToNotifier key notifier prio $ handler =<< pull
@@ -334,9 +332,9 @@ instance Monoid (Event a) where
   mconcat = mergeEvents
 
 listenToEvent :: WeakKey -> Event a -> Priority -> ([a] -> Run ()) -> Initialize ()
-listenToEvent key (Evt evtPrio evt) prio handler = do
+listenToEvent key (Evt _ evt) prio handler = do
   (evtPull, evtNot) <- evt
-  listenToPullPush key evtPull evtNot (priLoc evtPrio) prio $ \occs ->
+  listenToPullPush key evtPull evtNot prio $ \occs ->
     when (not $ null occs) $ handler occs
 
 newEventSG :: Priority -> SignalGen (Event a, [a] -> Run (), WeakKey)
@@ -362,7 +360,7 @@ eventTrigger buf notify occs = do
   notify
 
 transformEvent :: ([a] -> [b]) -> Event a -> Event b
-transformEvent f parent@(Evt evprio _) = Evt prio $ transparentMemo (priLoc evprio) memoprio $ do
+transformEvent f parent@(Evt evprio _) = Evt prio $ transparentMemo memoprio $ do
   (pullpush, trigger, key) <- newEventInit
   listenToEvent key parent prio $ \xs -> case f xs of
     [] -> return ()
@@ -373,7 +371,7 @@ transformEvent f parent@(Evt evprio _) = Evt prio $ transparentMemo (priLoc evpr
     prio = nextPrio memoprio
 
 transformEvent1 :: ([a] -> [b]{-non-empty-}) -> Event a -> Event b
-transformEvent1 f (Evt evprio evt) = Evt prio $ transparentMemo (priLoc evprio) memoprio $ do
+transformEvent1 f (Evt evprio evt) = Evt prio $ transparentMemo memoprio $ do
   (pull, notifier) <- evt
   return (f <$> pull, notifier)
   where
@@ -470,7 +468,7 @@ discreteTrigger buf notify val = do
   notify
 
 mapDiscrete :: (a -> b) -> Discrete a -> Discrete b
-mapDiscrete f (Dis dprio dis) = Dis prio $ transparentMemo (priLoc dprio) memoprio $ do
+mapDiscrete f (Dis dprio dis) = Dis prio $ transparentMemo memoprio $ do
   (pull, notifier) <- dis
   return (f <$> pull, notifier)
   where
@@ -484,7 +482,7 @@ pureDiscrete value = Dis (bottomPrio bottomLocation) $
 apDiscrete :: Discrete (a -> b) -> Discrete a -> Discrete b
 -- both arguments must have been memoized
 apDiscrete (Dis fprio fun) (Dis aprio arg)
-    = Dis prio $ transparentMemo (priLoc srcprio) memoprio $ do
+    = Dis prio $ transparentMemo memoprio $ do
   dirtyRef <- newRef False
   (pullpush, set, key) <- newDiscreteInit (error "apDiscrete: uninitialized")
   (funPull, funNot) <- fun
@@ -505,9 +503,9 @@ apDiscrete (Dis fprio fun) (Dis aprio arg)
     prio = nextPrio memoprio
 
 listenToDiscrete :: WeakKey -> Discrete a -> Priority -> (a -> Run ()) -> Initialize ()
-listenToDiscrete key (Dis disPrio dis) prio handler = do
+listenToDiscrete key (Dis _ dis) prio handler = do
   (disPull, disNot) <- dis
-  listenToPullPush key disPull disNot (priLoc disPrio) prio handler
+  listenToPullPush key disPull disNot prio handler
 
 ----------------------------------------------------------------------
 -- signals
@@ -565,8 +563,8 @@ delayS initial ~(Sig _sigprio sig) = do
 
 signalFromList :: [a] -> SignalGen (Signal a)
 signalFromList xs = do
-  clock@(Evt clockPrio _) <- dropStepE stepClockE
-  suffixD@(Dis suffixPrio _) <- accumD xs $ drop 1 <$ clock
+  clock <- dropStepE stepClockE
+  suffixD <- accumD xs $ drop 1 <$ clock
   return $ discreteToSignal $ hd <$> suffixD
   where
     hd = fromMaybe (error "listToSignal: list exhausted") .
@@ -669,66 +667,6 @@ debugTraceEnabled = False
 ----------------------------------------------------------------------
 -- tests
 
-test_signalFromList = do
-  r <- networkToList 4 $ signalFromList ["foo", "bar", "baz", "quux"]
-  r @?= ["foo", "bar", "baz", "quux"]
-
-test_accumD = do
-  r <- networkToList 3 $ do
-    strS <- signalFromList ["foo", "", "baz"]
-    accD <- accumD "<zero>" $ append <$> signalToEvent strS
-    return $ discreteToSignal accD
-  r @?= ["<zero>/'f'/'o'/'o'", "<zero>/'f'/'o'/'o'", "<zero>/'f'/'o'/'o'/'b'/'a'/'z'"]
-  where
-    append ch str = str ++ "/" ++ show ch
-
-test_changesD = do
-  r <- networkToList 3 $ do
-    strS <- signalFromList ["foo", "", "baz"]
-    accD <- accumD "<zero>" $ append <$> signalToEvent strS
-    return $ eventToSignal $ changesD accD
-  r @?= [["<zero>/'f'/'o'/'o'"], [], ["<zero>/'f'/'o'/'o'/'b'/'a'/'z'"]]
-  where
-    append ch str = str ++ "/" ++ show ch
-
-test_mappendEvent = do
-  r <- networkToListGC 3 $ do
-    strS <- signalFromList ["foo", "", "baz"]
-    accD <- accumD "<zero>" $ append <$> signalToEvent strS
-    return $ eventToSignal $ changesD accD `mappend` (signalToEvent $ (:[]) <$> strS)
-  r @?= [["<zero>/'f'/'o'/'o'", "foo"], [""], ["<zero>/'f'/'o'/'o'/'b'/'a'/'z'", "baz"]]
-  where
-    append ch str = str ++ "/" ++ show ch
-
-test_fmapEvent = do
-  succCountRef <- newRef (0::Int)
-  r <- networkToListGC 3 $ do
-    strS <- signalFromList ["foo", "", "baz"]
-    let lenE = mysucc succCountRef <$> signalToEvent strS
-    return $ eventToSignal $ lenE `mappend` lenE
-  r @?= ["gppgpp", "", "cb{cb{"]
-  count <- readRef succCountRef
-  count @?= 6
-  where
-    {-# NOINLINE mysucc #-}
-    mysucc ref c = unsafePerformIO $ do
-      modifyRef ref (+1)
-      return $ succ c
-
-test_filterE = do
-  r <- networkToListGC 3 $ do
-    strS <- signalFromList ["FOo", "", "bAz"]
-    let lenE = filterE Char.isUpper $ signalToEvent strS
-    return $ eventToSignal $ lenE `mappend` lenE
-  r @?= ["FOFO", "", "AA"]
-
-test_dropStepE = do
-  r <- networkToListGC 3 $ do
-    strS <- signalFromList ["foo", "", "baz"]
-    lenE <- dropStepE $ signalToEvent strS
-    return $ eventToSignal $ lenE `mappend` lenE
-  r @?= ["", "", "bazbaz"]
-
 _unitTest :: IO Counts
 _unitTest = runTestTT $ test
   [ test_signalFromList
@@ -739,5 +677,66 @@ _unitTest = runTestTT $ test
   , test_filterE
   , test_dropStepE
   ]
+  where
+    test_signalFromList = do
+      r <- networkToList 4 $ signalFromList ["foo", "bar", "baz", "quux"]
+      r @?= ["foo", "bar", "baz", "quux"]
+
+    test_accumD = do
+      r <- networkToList 3 $ do
+        strS <- signalFromList ["foo", "", "baz"]
+        accD <- accumD "<>" $ append <$> signalToEvent strS
+        return $ discreteToSignal accD
+      r @?= ["<>/'f'/'o'/'o'", "<>/'f'/'o'/'o'", "<>/'f'/'o'/'o'/'b'/'a'/'z'"]
+      where
+        append ch str = str ++ "/" ++ show ch
+
+    test_changesD = do
+      r <- networkToList 3 $ do
+        strS <- signalFromList ["foo", "", "baz"]
+        accD <- accumD "<>" $ append <$> signalToEvent strS
+        return $ eventToSignal $ changesD accD
+      r @?= [["<>/'f'/'o'/'o'"], [], ["<>/'f'/'o'/'o'/'b'/'a'/'z'"]]
+      where
+        append ch str = str ++ "/" ++ show ch
+
+    test_mappendEvent = do
+      r <- networkToListGC 3 $ do
+        strS <- signalFromList ["foo", "", "baz"]
+        accD <- accumD "<>" $ append <$> signalToEvent strS
+        return $ eventToSignal $
+          changesD accD `mappend` (signalToEvent $ (:[]) <$> strS)
+      r @?= [["<>/'f'/'o'/'o'", "foo"], [""], ["<>/'f'/'o'/'o'/'b'/'a'/'z'", "baz"]]
+      where
+        append ch str = str ++ "/" ++ show ch
+
+    test_fmapEvent = do
+      succCountRef <- newRef (0::Int)
+      r <- networkToListGC 3 $ do
+        strS <- signalFromList ["foo", "", "baz"]
+        let lenE = mysucc succCountRef <$> signalToEvent strS
+        return $ eventToSignal $ lenE `mappend` lenE
+      r @?= ["gppgpp", "", "cb{cb{"]
+      count <- readRef succCountRef
+      count @?= 6
+      where
+        {-# NOINLINE mysucc #-}
+        mysucc ref c = unsafePerformIO $ do
+          modifyRef ref (+1)
+          return $ succ c
+
+    test_filterE = do
+      r <- networkToListGC 3 $ do
+        strS <- signalFromList ["FOo", "", "bAz"]
+        let lenE = filterE Char.isUpper $ signalToEvent strS
+        return $ eventToSignal $ lenE `mappend` lenE
+      r @?= ["FOFO", "", "AA"]
+
+    test_dropStepE = do
+      r <- networkToListGC 3 $ do
+        strS <- signalFromList ["foo", "", "baz"]
+        lenE <- dropStepE $ signalToEvent strS
+        return $ eventToSignal $ lenE `mappend` lenE
+      r @?= ["", "", "bazbaz"]
 
 -- vim: sw=2 ts=2 sts=2
