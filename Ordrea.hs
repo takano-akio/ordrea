@@ -678,6 +678,7 @@ _unitTest = runTestTT $ test
   , test_fmapEvent
   , test_filterE
   , test_dropStepE
+  , test_apDiscrete
   ]
   where
     test_signalFromList = do
@@ -740,5 +741,15 @@ _unitTest = runTestTT $ test
         lenE <- dropStepE $ signalToEvent strS
         return $ eventToSignal $ lenE `mappend` lenE
       r @?= ["", "", "bazbaz"]
+
+    test_apDiscrete = do
+      r <- networkToListGC 4 $ do
+        ev0 <- signalToEvent <$> signalFromList [[1::Int], [], [], [2,3]]
+        ev1 <- signalToEvent <$> signalFromList [[], [4], [], [5]]
+        dis0 <- accumD 0 $ max <$> ev0
+        dis1 <- accumD 0 $ max <$> ev1
+        let dis = (*) <$> dis0 <*> dis1
+        return $ eventToSignal $ changesD dis
+      r @?= [[0], [4], [], [15]]
 
 -- vim: sw=2 ts=2 sts=2
