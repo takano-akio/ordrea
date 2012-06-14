@@ -594,6 +594,8 @@ changesD :: Discrete a -> Event a
 changesD (Dis prio dis) = Evt prio $ do
   (pull, notifier) <- dis
   return ((:[]) <$> pull, notifier)
+    -- FIXME: this is very wrong; the pull must return [] if
+    -- the value hasn't changed
 
 ----------------------------------------------------------------------
 -- events and signals
