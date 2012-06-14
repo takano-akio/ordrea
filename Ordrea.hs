@@ -594,11 +594,13 @@ accumD initial evt@(~(Evt evtprio _)) = do
     prio = nextPrio evtprio
 
 changesD :: Discrete a -> Event a
-changesD (Dis prio dis) = Evt prio $ do
-  (pull, notifier) <- dis
-  return ((:[]) <$> pull, notifier)
-    -- FIXME: this is very wrong; the pull must return [] if
-    -- the value hasn't changed
+changesD (Dis disprio dis) = Evt prio $ unsafeOnce $ do
+  (pullpush, trigger, key) <- newEventInit
+  (dispull, notifier) <- dis
+  listenToNotifier key notifier prio $ trigger . (:[]) =<< dispull
+  return pullpush
+  where
+    prio = nextPrio disprio
 
 ----------------------------------------------------------------------
 -- events and signals
