@@ -16,10 +16,10 @@ import Data.Monoid
 import Data.Ord (comparing)
 import qualified Data.Vector.Unboxed as U
 import Data.Word
-import Debug.Trace
 import System.IO.Unsafe
 import System.Mem (performGC)
 import System.Mem.Weak
+import Test.HUnit
 
 import Weak
 
@@ -577,6 +577,11 @@ networkToList count network = do
   smp <- start network
   replicateM count smp
 
+networkToListGC :: Int -> SignalGen (Signal a) -> IO [a]
+networkToListGC count network = do
+  smp <- start network
+  replicateM count (performGC >> smp)
+
 ----------------------------------------------------------------------
 -- events and discretes
 
@@ -664,105 +669,75 @@ debugTraceEnabled = False
 ----------------------------------------------------------------------
 -- tests
 
-test0 = do
-  smp <- start $ do
-    strS <- externalS $ do
-      putStrLn "input:"
-      getLine
-    return $ eventToSignal (signalToEvent strS)
-  smp >>= print
-  smp >>= print
-  smp >>= print
-  smp >>= print
+test_signalFromList = do
+  r <- networkToList 4 $ signalFromList ["foo", "bar", "baz", "quux"]
+  r @?= ["foo", "bar", "baz", "quux"]
 
-test1 = do
-  smp <- start $ do
-    strS <- externalS $ do
-      putStrLn "input:"
-      getLine
+test_accumD = do
+  r <- networkToList 3 $ do
+    strS <- signalFromList ["foo", "", "baz"]
     accD <- accumD "<zero>" $ append <$> signalToEvent strS
     return $ discreteToSignal accD
-  smp >>= print
-  smp >>= print
-  smp >>= print
+  r @?= ["<zero>/'f'/'o'/'o'", "<zero>/'f'/'o'/'o'", "<zero>/'f'/'o'/'o'/'b'/'a'/'z'"]
   where
     append ch str = str ++ "/" ++ show ch
 
-test2 = do
-  smp <- start $ do
-    strS <- externalS $ do
-      putStrLn "input:"
-      getLine
+test_changesD = do
+  r <- networkToList 3 $ do
+    strS <- signalFromList ["foo", "", "baz"]
     accD <- accumD "<zero>" $ append <$> signalToEvent strS
     return $ eventToSignal $ changesD accD
-  smp >>= print
-  smp >>= print
-  smp >>= print
+  r @?= [["<zero>/'f'/'o'/'o'"], [], ["<zero>/'f'/'o'/'o'/'b'/'a'/'z'"]]
   where
     append ch str = str ++ "/" ++ show ch
 
-test3 = do
-  smp <- start $ do
-    strS <- externalS $ do
-      putStrLn "input:"
-      getLine
+test_mappendEvent = do
+  r <- networkToListGC 3 $ do
+    strS <- signalFromList ["foo", "", "baz"]
     accD <- accumD "<zero>" $ append <$> signalToEvent strS
     return $ eventToSignal $ changesD accD `mappend` (signalToEvent $ (:[]) <$> strS)
-  let go = performGC >> smp >>= print
-  go
-  go
-  go
+  r @?= [["<zero>/'f'/'o'/'o'", "foo"], [""], ["<zero>/'f'/'o'/'o'/'b'/'a'/'z'", "baz"]]
   where
     append ch str = str ++ "/" ++ show ch
 
-test4 = do
-  smp <- start $ do
-    strS <- externalS $ do
-      putStrLn "input:"
-      getLine
-    let lenE = mysucc <$> signalToEvent strS
+test_fmapEvent = do
+  succCountRef <- newRef (0::Int)
+  r <- networkToListGC 3 $ do
+    strS <- signalFromList ["foo", "", "baz"]
+    let lenE = mysucc succCountRef <$> signalToEvent strS
     return $ eventToSignal $ lenE `mappend` lenE
-  let go = performGC >> smp >>= print
-  go
-  go
-  go
+  r @?= ["gppgpp", "", "cb{cb{"]
+  count <- readRef succCountRef
+  count @?= 6
   where
-    mysucc c = trace ("mysucc: " ++ show c) (succ c)
+    {-# NOINLINE mysucc #-}
+    mysucc ref c = unsafePerformIO $ do
+      modifyRef ref (+1)
+      return $ succ c
 
-test5 = do
-  smp <- start $ do
-    strS <- externalS $ do
-      putStrLn "input:"
-      getLine
-    let lenE = signalToEvent strS
-    return $ eventToSignal $ lenE `mappend` lenE
-  let go = performGC >> smp >>= print
-  go
-  go
-  go
-
-test6 = do
-  smp <- start $ do
-    strS <- externalS $ do
-      putStrLn "input:"
-      getLine
+test_filterE = do
+  r <- networkToListGC 3 $ do
+    strS <- signalFromList ["FOo", "", "bAz"]
     let lenE = filterE Char.isUpper $ signalToEvent strS
     return $ eventToSignal $ lenE `mappend` lenE
-  let go = performGC >> smp >>= print
-  go
-  go
-  go
+  r @?= ["FOFO", "", "AA"]
 
-test7 = do
-  smp <- start $ do
-    strS <- externalS $ do
-      putStrLn "input:"
-      getLine
+test_dropStepE = do
+  r <- networkToListGC 3 $ do
+    strS <- signalFromList ["foo", "", "baz"]
     lenE <- dropStepE $ signalToEvent strS
     return $ eventToSignal $ lenE `mappend` lenE
-  let go = performGC >> smp >>= print
-  go
-  go
-  go
+  r @?= ["", "", "bazbaz"]
+
+_unitTest :: IO Counts
+_unitTest = runTestTT $ test
+  [ test_signalFromList
+  , test_accumD
+  , test_changesD
+  , test_mappendEvent
+  , test_fmapEvent
+  , test_filterE
+  , test_dropStepE
+  ]
 
 -- vim: sw=2 ts=2 sts=2
