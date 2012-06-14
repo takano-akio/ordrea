@@ -572,6 +572,11 @@ signalFromList xs = do
     hd = fromMaybe (error "listToSignal: list exhausted") .
       listToMaybe
 
+networkToList :: Int -> SignalGen (Signal a) -> IO [a]
+networkToList count network = do
+  smp <- start network
+  replicateM count smp
+
 ----------------------------------------------------------------------
 -- events and discretes
 
