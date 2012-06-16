@@ -605,6 +605,14 @@ changesD (Dis disprio dis) = Evt prio $ unsafeOnce $ do
   where
     prio = nextPrio disprio
 
+preservesD :: Discrete a -> SignalGen (Event a)
+preservesD dis@ ~(Dis disprio _) = do
+  (evt, trigger, key) <- newEventSG prio
+  registerInit $ listenToDiscrete key dis prio $ \val -> trigger [val]
+  return evt
+  where
+    prio = nextPrio disprio
+
 ----------------------------------------------------------------------
 -- events and signals
 
@@ -683,6 +691,7 @@ _unitTest = runTestTT $ test
   , test_dropStepE
   , test_apDiscrete
   , test_eventFromList
+  , test_preservesD
   ]
   where
     test_signalFromList = do
@@ -761,5 +770,13 @@ _unitTest = runTestTT $ test
         ev <- eventFromList [[2::Int], [], [3,4]]
         return $ eventToSignal ev
       r @?= [[2], [], [3,4]]
+
+    test_preservesD = do
+      r <- networkToListGC 3 $ do
+        ev <- eventFromList [[], [], [3,4::Int]]
+        dis <- accumD 0 (const <$> ev)
+        ev1 <- preservesD dis
+        return $ eventToSignal ev1
+      r @?= [[0], [], [4]]
 
 -- vim: sw=2 ts=2 sts=2
