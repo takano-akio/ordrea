@@ -1,5 +1,6 @@
 {-# LANGUAGE DeriveFunctor, GeneralizedNewtypeDeriving, ExistentialQuantification #-}
 {-# OPTIONS_GHC -Wall #-}
+{-# OPTIONS_GHC -fno-warn-missing-signatures #-}
 module Ordrea where
 
 import Control.Applicative
@@ -775,90 +776,90 @@ _unitTest = runTestTT $ test
   , test_eventFromList
   , test_preservesD
   ]
+
+test_signalFromList = do
+  r <- networkToList 4 $ signalFromList ["foo", "bar", "baz", "quux"]
+  r @?= ["foo", "bar", "baz", "quux"]
+
+test_accumD = do
+  r <- networkToList 3 $ do
+    strS <- signalFromList ["foo", "", "baz"]
+    accD <- accumD "<>" $ append <$> signalToEvent strS
+    return $ discreteToSignal accD
+  r @?= ["<>/'f'/'o'/'o'", "<>/'f'/'o'/'o'", "<>/'f'/'o'/'o'/'b'/'a'/'z'"]
   where
-    test_signalFromList = do
-      r <- networkToList 4 $ signalFromList ["foo", "bar", "baz", "quux"]
-      r @?= ["foo", "bar", "baz", "quux"]
+    append ch str = str ++ "/" ++ show ch
 
-    test_accumD = do
-      r <- networkToList 3 $ do
-        strS <- signalFromList ["foo", "", "baz"]
-        accD <- accumD "<>" $ append <$> signalToEvent strS
-        return $ discreteToSignal accD
-      r @?= ["<>/'f'/'o'/'o'", "<>/'f'/'o'/'o'", "<>/'f'/'o'/'o'/'b'/'a'/'z'"]
-      where
-        append ch str = str ++ "/" ++ show ch
+test_changesD = do
+  r <- networkToList 3 $ do
+    strS <- signalFromList ["foo", "", "baz"]
+    accD <- accumD "<>" $ append <$> signalToEvent strS
+    return $ eventToSignal $ changesD accD
+  r @?= [[], [], ["<>/'f'/'o'/'o'/'b'/'a'/'z'"]]
+  where
+    append ch str = str ++ "/" ++ show ch
 
-    test_changesD = do
-      r <- networkToList 3 $ do
-        strS <- signalFromList ["foo", "", "baz"]
-        accD <- accumD "<>" $ append <$> signalToEvent strS
-        return $ eventToSignal $ changesD accD
-      r @?= [[], [], ["<>/'f'/'o'/'o'/'b'/'a'/'z'"]]
-      where
-        append ch str = str ++ "/" ++ show ch
+test_mappendEvent = do
+  r <- networkToListGC 3 $ do
+    strS <- signalFromList ["foo", "", "baz"]
+    accD <- accumD "<>" $ append <$> signalToEvent strS
+    return $ eventToSignal $
+      changesD accD `mappend` (signalToEvent $ (:[]) <$> strS)
+  r @?= [["foo"], [""], ["<>/'f'/'o'/'o'/'b'/'a'/'z'", "baz"]]
+  where
+    append ch str = str ++ "/" ++ show ch
 
-    test_mappendEvent = do
-      r <- networkToListGC 3 $ do
-        strS <- signalFromList ["foo", "", "baz"]
-        accD <- accumD "<>" $ append <$> signalToEvent strS
-        return $ eventToSignal $
-          changesD accD `mappend` (signalToEvent $ (:[]) <$> strS)
-      r @?= [["foo"], [""], ["<>/'f'/'o'/'o'/'b'/'a'/'z'", "baz"]]
-      where
-        append ch str = str ++ "/" ++ show ch
+test_fmapEvent = do
+  succCountRef <- newRef (0::Int)
+  r <- networkToListGC 3 $ do
+    strS <- signalFromList ["foo", "", "baz"]
+    let lenE = mysucc succCountRef <$> signalToEvent strS
+    return $ eventToSignal $ lenE `mappend` lenE
+  r @?= ["gppgpp", "", "cb{cb{"]
+  count <- readRef succCountRef
+  count @?= 6
+  where
+    {-# NOINLINE mysucc #-}
+    mysucc ref c = unsafePerformIO $ do
+      modifyRef ref (+1)
+      return $ succ c
 
-    test_fmapEvent = do
-      succCountRef <- newRef (0::Int)
-      r <- networkToListGC 3 $ do
-        strS <- signalFromList ["foo", "", "baz"]
-        let lenE = mysucc succCountRef <$> signalToEvent strS
-        return $ eventToSignal $ lenE `mappend` lenE
-      r @?= ["gppgpp", "", "cb{cb{"]
-      count <- readRef succCountRef
-      count @?= 6
-      where
-        {-# NOINLINE mysucc #-}
-        mysucc ref c = unsafePerformIO $ do
-          modifyRef ref (+1)
-          return $ succ c
+test_filterE = do
+  r <- networkToListGC 4 $ do
+    strS <- signalFromList ["FOo", "", "nom", "bAz"]
+    let lenE = filterE Char.isUpper $ signalToEvent strS
+    return $ eventToSignal $ lenE `mappend` lenE
+  r @?= ["FOFO", "", "", "AA"]
 
-    test_filterE = do
-      r <- networkToListGC 4 $ do
-        strS <- signalFromList ["FOo", "", "nom", "bAz"]
-        let lenE = filterE Char.isUpper $ signalToEvent strS
-        return $ eventToSignal $ lenE `mappend` lenE
-      r @?= ["FOFO", "", "", "AA"]
+test_dropStepE = do
+  r <- networkToListGC 3 $ do
+    strS <- signalFromList ["foo", "", "baz"]
+    lenE <- dropStepE $ signalToEvent strS
+    return $ eventToSignal $ lenE `mappend` lenE
+  r @?= ["", "", "bazbaz"]
 
-    test_dropStepE = do
-      r <- networkToListGC 3 $ do
-        strS <- signalFromList ["foo", "", "baz"]
-        lenE <- dropStepE $ signalToEvent strS
-        return $ eventToSignal $ lenE `mappend` lenE
-      r @?= ["", "", "bazbaz"]
+test_apDiscrete = do
+  r <- networkToListGC 4 $ do
+    ev0 <- signalToEvent <$> signalFromList [[], [], [1::Int], [2,3]]
+    ev1 <- signalToEvent <$> signalFromList [[], [4], [], [5]]
+    dis0 <- accumD 0 $ max <$> ev0
+    dis1 <- accumD 0 $ max <$> ev1
+    let dis = (*) <$> dis0 <*> dis1
+    return $ eventToSignal $ changesD dis
+  r @?= [[], [0], [4], [15]]
 
-    test_apDiscrete = do
-      r <- networkToListGC 4 $ do
-        ev0 <- signalToEvent <$> signalFromList [[], [], [1::Int], [2,3]]
-        ev1 <- signalToEvent <$> signalFromList [[], [4], [], [5]]
-        dis0 <- accumD 0 $ max <$> ev0
-        dis1 <- accumD 0 $ max <$> ev1
-        let dis = (*) <$> dis0 <*> dis1
-        return $ eventToSignal $ changesD dis
-      r @?= [[], [0], [4], [15]]
+test_eventFromList = do
+  r <- networkToListGC 3 $ do
+    ev <- eventFromList [[2::Int], [], [3,4]]
+    return $ eventToSignal ev
+  r @?= [[2], [], [3,4]]
 
-    test_eventFromList = do
-      r <- networkToListGC 3 $ do
-        ev <- eventFromList [[2::Int], [], [3,4]]
-        return $ eventToSignal ev
-      r @?= [[2], [], [3,4]]
-
-    test_preservesD = do
-      r <- networkToListGC 3 $ do
-        ev <- eventFromList [[], [], [3,4::Int]]
-        dis <- accumD 0 (const <$> ev)
-        ev1 <- preservesD dis
-        return $ eventToSignal ev1
-      r @?= [[0], [], [4]]
+test_preservesD = do
+  r <- networkToListGC 3 $ do
+    ev <- eventFromList [[], [], [3,4::Int]]
+    dis <- accumD 0 (const <$> ev)
+    ev1 <- preservesD dis
+    return $ eventToSignal ev1
+  r @?= [[0], [], [4]]
 
 -- vim: sw=2 ts=2 sts=2
