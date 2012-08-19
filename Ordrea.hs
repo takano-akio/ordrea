@@ -25,6 +25,37 @@ import Test.HUnit
 
 import Weak
 
+-- Phases
+--
+-- Execution of an ordrea program can be broken down into the
+-- following phases:
+--
+-- * Construction (SignalGen monad)
+--   The construction phase is the first step to construct a new
+--   (sub)network. In this phase, new nodes are created and a fresh location
+--   is assigned to each dynamic node. This is the only phase the user
+--   describes directly.
+-- * Initialization (Initialize monad)
+--   This phase completes construction of a new (sub)network. Nodes are
+--   connected together in this phase.
+-- * Execution step (Run monad)
+--   This phase updates internal states of the network, moving the
+--   computation one step forward.
+-- * Finalization step (Finalize monad)
+--   This phase comes after each execution step. The 'current state' of
+--   an event node is reset to [] in this phase.
+--
+-- For the toplevel network the construction phase comes before the first
+-- execution step. On the other hand, a subnetwork is constructed during
+-- an execution step and is immediately updated as part of the current
+-- execution step.
+--
+-- (Rationale)
+-- + Why is a separate initialization phase needed?
+-- - Because functions in the SignalGen monad cannot examine given signals.
+--   Doing so would result in a NonTermination exception in case of a circular
+--   circuit.
+
 newtype SignalGen a = SignalGen (ReaderT GEnv IO a)
   deriving (Monad, Functor, Applicative, MonadIO)
 type Initialize = ReaderT IEnv IO
@@ -38,7 +69,7 @@ data Discrete a = Dis !Priority !(Initialize (Pull a, Notifier))
 type Consumer a = a -> IO ()
 
 ----------------------------------------------------------------------
--- callback mode
+-- callback modes
 
 data CallbackMode = Pull | Push
 
@@ -730,6 +761,9 @@ newActionAccum = do
   where
     add ref act = modifyIORef ref (act:)
     run ref = readRef ref >>= sequence_
+
+----------------------------------------------------------------------
+-- internal debugging
 
 debug :: (MonadIO m) => String -> m ()
 debug str = when debugTraceEnabled $ liftIO $ do
