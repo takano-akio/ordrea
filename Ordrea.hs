@@ -145,7 +145,7 @@ runSignalGen parentLoc clock (SignalGen gen) = do
   return (result, runAccumF)
 
 runSignalGenInStep :: Location -> Notifier -> SignalGen a -> Run a
-runSignalGenInStep parentLoc clock sgen = do
+runSignalGenInStep parentLoc clock sgen = debugFrame "SGenInStep" $ do
   (result, initial) <- liftIO $ runSignalGen parentLoc clock sgen
   isolatingUpdates initial
   return result
@@ -203,7 +203,7 @@ data REnv = REnv
   }
 
 runRun :: Run a -> IO a
-runRun run = do
+runRun run = debugFrame "runRun" $ do
   (registerF, runAccumF) <- liftIO newActionAccum
   pqueueRef <- newRef M.empty
   let
@@ -212,11 +212,11 @@ runRun run = do
       , envPendingUpdates = pqueueRef
       }
   result <- runReaderT (run <* runUpdates) renv
-  runAccumF
+  debugFrame "fini" runAccumF
   return result
 
 runUpdates :: Run ()
-runUpdates = asks envPendingUpdates >>= loop
+runUpdates = debugFrame "runUpdates" $ asks envPendingUpdates >>= loop
   where
     loop pqueueRef = do
       pending <- readRef pqueueRef
@@ -239,12 +239,15 @@ registerUpd prio upd = do
   modifyRef pqueueRef $ M.insertWith' (>>) prio upd
 
 isolatingUpdates :: Run a -> Run a
-isolatingUpdates action = debugFrame "isolatingUpdates" $ do
+isolatingUpdates action = do
   pqueueRef <- asks envPendingUpdates
   pqueue <- readRef pqueueRef
   writeRef pqueueRef M.empty
+  debug "isolating updates"
   result <- action
+  debug "running isolated updates"
   runUpdates
+  debug "done running isolated updates"
   writeRef pqueueRef pqueue
   return result
 
@@ -357,7 +360,8 @@ primMemo
   -> Initialize (Pull a, Notifier)
 primMemo prio m'reset (pull, notifier) =
     debugFrame ("primMemo[prio=" ++ show prio ++ "]") $ do
-  cacheRef <- newRef $ error "primMemo: cache not initialized"
+  debug $ "primMemo: new"
+  cacheRef <- newRef $ error $ "primMemo: cache not initialized; prio=" ++ show prio
   listenToPullPush (WeakKey cacheRef) pull notifier prio $ \_mode val -> do
     debug $ "primMemo: writing to cache: prio=" ++ show prio
     writeRef cacheRef val
@@ -628,14 +632,15 @@ joinS ~(Sig _sigsigprio sigsig) = do
   here <- genLocation
   let prio = bottomPrio here
   pull <- newCachedPull $ do
+    debug $ "joinS: making pull; prio=" ++ show prio
     parLoc <- getParentLocation
     clock <- getClock
     sigpull <- sigsig
-    return $ do
+    return $ debugFrame ("joinS.pull[prio=" ++ show prio ++ "]") $ do
       Sig _sigprio sig <- sigpull
       (pull, first) <- liftIO $ runInit parLoc clock sig
-      first
-      pull
+      debugFrame "fist-step" first
+      debugFrame "pull" pull
   return $! Sig prio $ return pull
 
 delayS :: a -> Signal a -> SignalGen (Signal a)
