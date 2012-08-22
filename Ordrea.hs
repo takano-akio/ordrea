@@ -629,7 +629,15 @@ listenToDiscrete key (Dis _ dis) prio handler = do
 -- signals
 
 instance Functor Signal where
-  fmap f (Sig prio pull) = Sig prio (fmap f <$> pull) -- TODO: memoize
+  fmap f (Sig prio pull) = Sig prio $ transparentMemoS $ fmap f <$> pull
+
+instance Applicative Signal where
+  pure x = Sig (bottomPrio bottomLocation) (return $ pure x)
+  Sig f_prio f_init <*> Sig a_prio a_init =
+      Sig (max f_prio a_prio) $ transparentMemoS $ do
+    f_pull <- f_init
+    a_pull <- a_init
+    return $ f_pull <*> a_pull
 
 start :: SignalGen (Signal a) -> IO (IO a)
 start gensig = do
@@ -845,6 +853,7 @@ _unitTest = runTestTT $ test
   , test_joinS
   , test_generatorE
   , test_accumE
+  , test_fmapSignal
   ]
 
 test_signalFromList = do
@@ -962,5 +971,21 @@ test_accumE = do
   r @?= [["<>f", "<>fo", "<>foo"], [], ["<>foob", "<>fooba", "<>foobaz"]]
   where
     append ch str = str ++ [ch]
+
+test_fmapSignal = do
+  succCountRef <- newRef (0::Int)
+  r <- networkToListGC 3 $ do
+    chS <- signalFromList ['f', 'a', 'r']
+    let fchS = mysucc succCountRef <$> chS
+    return $ comb <$> fchS <*> (mysucc succCountRef <$> fchS)
+  r @?= ["gh", "bc", "st"]
+  count <- readRef succCountRef
+  count @?= 6
+  where
+    {-# NOINLINE mysucc #-}
+    mysucc ref c = unsafePerformIO $ do
+      modifyRef ref (+1)
+      return $ succ c
+    comb x y = [x, y]
 
 -- vim: sw=2 ts=2 sts=2
