@@ -519,6 +519,20 @@ dropStepE (Evt evtprio evt) = do
 eventFromList :: [[a]] -> SignalGen (Event a)
 eventFromList occs = signalToEvent <$> signalFromList (occs ++ repeat [])
 
+accumE :: a -> Event (a -> a) -> SignalGen (Event a)
+accumE initial evt@(~(Evt evtprio _)) = do
+  (myevt, trigger, key) <- newEventSG prio
+  ref <- newRef initial
+  registerInit $ listenToEvent key evt prio $ \mode occs -> do
+    debug $ "accumE: occs=" ++ show (length occs)
+    oldVal <- readRef ref
+    let _:vals = scanl (flip ($)) oldVal occs
+    writeRef ref $ last vals
+    trigger mode vals
+  return myevt
+  where
+    prio = nextPrio evtprio
+
 ----------------------------------------------------------------------
 -- discretes
 
@@ -816,6 +830,7 @@ _unitTest = runTestTT $ test
   , test_preservesD
   , test_joinS
   , test_generatorE
+  , test_accumE
   ]
 
 test_signalFromList = do
@@ -924,5 +939,14 @@ test_generatorE = do
     subnet1 = signalFromList [11, 12, 13, 14]
     subnet2 = signalFromList [21, 22, 23, 24]
     subnet3 = signalFromList [31, 32, 33, 34]
+
+test_accumE = do
+  r <- networkToList 3 $ do
+    strS <- signalFromList ["foo", "", "baz"]
+    accE <- accumE "<>" $ append <$> signalToEvent strS
+    return $ eventToSignal accE
+  r @?= [["<>f", "<>fo", "<>foo"], [], ["<>foob", "<>fooba", "<>foobaz"]]
+  where
+    append ch str = str ++ [ch]
 
 -- vim: sw=2 ts=2 sts=2
