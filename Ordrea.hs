@@ -9,7 +9,6 @@ import Control.Monad.IO.Class
 import Control.Monad.Trans.Class
 import Control.Monad.Trans.Reader
 import qualified Data.Char as Char
-import qualified Data.Foldable as Fold
 import Data.IORef
 import Data.List
 import qualified Data.Map as M
@@ -345,35 +344,52 @@ transparentMemoD
   :: Priority
   -> Initialize (Pull a, Notifier)
   -> Initialize (Pull a, Notifier)
-transparentMemoD prio orig = unsafeProtectFromDup (primMemo prio Nothing) orig
+transparentMemoD prio orig = unsafeProtectFromDup (primMemoDiscrete prio) orig
 
 transparentMemoE
-  :: Priority
+  :: Initialize (Pull [a], Notifier)
   -> Initialize (Pull [a], Notifier)
-  -> Initialize (Pull [a], Notifier)
-transparentMemoE prio orig = unsafeProtectFromDup (primMemo prio (Just [])) orig
+transparentMemoE orig = unsafeProtectFromDup memo orig
+  where
+    memo (pull, notifier) = do
+      cachedPull <- primStepMemo pull
+      return (cachedPull, notifier)
 
-primMemo
+transparentMemoS :: Initialize (Pull a) -> Initialize (Pull a)
+transparentMemoS orig = unsafeProtectFromDup primStepMemo orig
+
+-- | Cache a @Discrete@. The underlyng @Pull@ will be called at most once per
+-- notification.
+primMemoDiscrete
   :: Priority
-  -> Maybe a
   -> (Pull a, Notifier)
   -> Initialize (Pull a, Notifier)
-primMemo prio m'reset (pull, notifier) =
+primMemoDiscrete prio (pull, notifier) =
     debugFrame ("primMemo[prio=" ++ show prio ++ "]") $ do
   debug $ "primMemo: new"
   cacheRef <- newRef $ error $ "primMemo: cache not initialized; prio=" ++ show prio
   listenToPullPush (WeakKey cacheRef) pull notifier prio $ \_mode val -> do
     debug $ "primMemo: writing to cache: prio=" ++ show prio
     writeRef cacheRef val
-    Fold.forM_ m'reset $ \reset -> registerFini $ do
-      debug $ "primMemo: clearing cache: prio=" ++ show prio
-      writeRef cacheRef reset
   let
     readCache = do
       debug $ "primMemo: reading from cache: prio=" ++ show prio
       readRef cacheRef
   return (readCache, notifier)
-{-# NOINLINE primMemo #-} -- useful for debugging
+
+-- | Cache a @Pull@. The underlyng @Pull@ will be called at most once per step.
+primStepMemo :: Pull a -> Initialize (Pull a)
+primStepMemo pull = do
+  cacheRef <- newRef Nothing
+  return $ do
+    cache <- readRef cacheRef
+    case cache of
+      Just val -> return val
+      Nothing -> do
+        val <- pull
+        writeRef cacheRef (Just val)
+        registerFini $ writeRef cacheRef Nothing
+        return val
 
 listenToPullPush
   :: WeakKey
@@ -435,7 +451,7 @@ eventTrigger buf notify mode occs = do
   whenPush mode notify
 
 transformEvent :: ([a] -> [b]) -> Event a -> Event b
-transformEvent f parent@(Evt evprio _) = Evt memoprio $ debugFrame "transformEvent" $ transparentMemoE memoprio $ do
+transformEvent f parent@(Evt evprio _) = Evt prio $ debugFrame "transformEvent" $ transparentMemoE $ do
   (pullpush, trigger, key) <- newEventInit
   listenToEvent key parent prio $ \mode xs -> case f xs of
     [] -> do
@@ -447,15 +463,13 @@ transformEvent f parent@(Evt evprio _) = Evt memoprio $ debugFrame "transformEve
   return pullpush
   where
     prio = nextPrio evprio
-    memoprio = nextPrio prio
 
 transformEvent1 :: ([a] -> [b]{-non-empty-}) -> Event a -> Event b
-transformEvent1 f (Evt evprio evt) = Evt prio $ debugFrame "transformEvent1" $ transparentMemoE memoprio $ do
+transformEvent1 f (Evt evprio evt) = Evt prio $ debugFrame "transformEvent1" $ transparentMemoE $ do
   (pull, notifier) <- evt
   return (f <$> pull, notifier)
   where
-    memoprio = nextPrio evprio
-    prio = nextPrio memoprio
+    prio = nextPrio evprio
 
 generatorE :: Event (SignalGen a) -> SignalGen (Event a)
 generatorE evt = do
