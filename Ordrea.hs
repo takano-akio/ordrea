@@ -639,7 +639,7 @@ joinS ~(Sig _sigsigprio sigsig) = do
     return $ debugFrame ("joinS.pull[prio=" ++ show prio ++ "]") $ do
       Sig _sigprio sig <- sigpull
       (pull, first) <- liftIO $ runInit parLoc clock sig
-      debugFrame "fist-step" first
+      isolatingUpdates $ debugFrame "fist-step" first
       debugFrame "pull" pull
   return $! Sig prio $ return pull
 
