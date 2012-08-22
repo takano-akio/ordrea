@@ -809,6 +809,8 @@ _unitTest = runTestTT $ test
   , test_apDiscrete
   , test_eventFromList
   , test_preservesD
+  , test_joinS
+  , test_generatorE
   ]
 
 test_signalFromList = do
@@ -895,5 +897,27 @@ test_preservesD = do
     ev1 <- preservesD dis
     return $ eventToSignal ev1
   r @?= [[0], [], [4]]
+
+test_joinS = do
+  r <- networkToListGC 4 $ do
+    sig0 <- signalFromList [1, 2, 3, 4::Int]
+    sig1 <- signalFromList [11, 12, 13, 14]
+    sig2 <- signalFromList [21, 22, 23, 24]
+    sig3 <- signalFromList [31, 32, 33, 34]
+    sigSig <- signalFromList [sig0, sig3, sig2, sig1]
+    joinS sigSig
+  r @?= [1, 32, 23, 14]
+
+test_generatorE = do
+  r <- networkToListGC 4 $ do
+    evSig <- generatorE =<< eventFromList [[subnet0], [subnet1], [subnet2], [subnet3]]
+    let sigSig = head <$> eventToSignal evSig
+    joinS sigSig
+  r @?= [1, 11, 21, 31]
+  where
+    subnet0 = signalFromList [1, 2, 3, 4::Int]
+    subnet1 = signalFromList [11, 12, 13, 14]
+    subnet2 = signalFromList [21, 22, 23, 24]
+    subnet3 = signalFromList [31, 32, 33, 34]
 
 -- vim: sw=2 ts=2 sts=2
