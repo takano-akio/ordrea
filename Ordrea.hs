@@ -71,6 +71,7 @@ type Consumer a = a -> IO ()
 -- callback modes
 
 data CallbackMode = Pull | Push
+  deriving (Eq)
 
 whenPush :: CallbackMode -> Run () -> Run ()
 whenPush Push x = x
@@ -581,7 +582,7 @@ discreteTrigger buf notify mode val = do
   whenPush mode notify
 
 mapDiscrete :: (a -> b) -> Discrete a -> Discrete b
-mapDiscrete f (Dis dprio dis) = Dis prio $ transparentMemoD memoprio $ do
+mapDiscrete f (Dis dprio dis) = Dis prio $ debugFrame "mapDiscrete" $ transparentMemoD memoprio $ do
   (pull, notifier) <- dis
   return (f <$> pull, notifier)
   where
@@ -595,25 +596,33 @@ pureDiscrete value = Dis (bottomPrio bottomLocation) $
 apDiscrete :: Discrete (a -> b) -> Discrete a -> Discrete b
 -- both arguments must have been memoized
 apDiscrete (Dis fprio fun) (Dis aprio arg)
-    = Dis prio $ transparentMemoD memoprio $ do
+    = Dis memoprio $ debugFrame "apDiscrete" $ transparentMemoD memoprio $ do
   dirtyRef <- newRef False
+  isPullRef <- newRef False
   (pullpush, set, key) <- newDiscreteInit (error "apDiscrete: uninitialized")
   (funPull, funNot) <- fun
   (argPull, argNot) <- arg
   let
     upd = do
+      debug $ "apDiscrete.upd; prio=" ++ show prio
       dirty <- readRef dirtyRef
       when dirty $ do
+        isPull <- readRef isPullRef
         writeRef dirtyRef False
-        set Push =<< funPull <*> argPull
-  let handler = writeRef dirtyRef True >> registerUpd prio upd
-  listenToNotifier key funNot prio handler
-  listenToNotifier key argNot prio handler
+        writeRef isPullRef False
+        set (if isPull then Pull else Push) =<< funPull <*> argPull
+  let handler mode _ = do
+        debug $ "apDiscrete.handler: prio=" ++ show prio
+        writeRef dirtyRef True
+        modifyRef isPullRef (|| mode==Pull)
+        registerUpd prio upd
+  listenToPullPush key funPull funNot prio handler
+  listenToPullPush key argPull argNot prio handler
   return pullpush
   where
     srcprio = max fprio aprio
-    memoprio = nextPrio srcprio
-    prio = nextPrio memoprio
+    prio = nextPrio srcprio
+    memoprio = nextPrio prio
 
 listenToDiscrete
   :: WeakKey
@@ -693,7 +702,7 @@ delayS initial ~(Sig _sigprio sig) = do
     prio = bottomPrio bottomLocation
 
 signalFromList :: [a] -> SignalGen (Signal a)
-signalFromList xs = do
+signalFromList xs = debugFrame "signalFromList" $ do
   clock <- dropStepE stepClockE
   suffixD <- accumD xs $ drop 1 <$ clock
   return $ discreteToSignal $ hd <$> suffixD
@@ -716,9 +725,10 @@ networkToListGC count network = do
 
 accumD :: a -> Event (a -> a) -> SignalGen (Discrete a)
 accumD initial evt@(~(Evt evtprio _)) = do
+  debug $ "accumD: creating; prio=" ++ show prio
   (dis, get, set, key) <- newDiscreteSG initial prio
   registerInit $ listenToEvent key evt prio $ \mode occs -> do
-    debug $ "accumD: occs=" ++ show (length occs)
+    debug $ "accumD: prio=" ++ show prio ++ "; occs=" ++ show (length occs)
     oldVal <- get
     set mode $! foldl' (flip ($)) oldVal occs
   return dis
