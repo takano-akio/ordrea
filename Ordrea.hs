@@ -848,6 +848,7 @@ _unitTest = runTestTT $ test
   , test_filterE
   , test_dropStepE
   , test_apDiscrete
+  , test_apDiscrete1
   , test_eventFromList
   , test_preservesD
   , test_joinS
@@ -926,6 +927,16 @@ test_apDiscrete = do
     let dis = (*) <$> dis0 <*> dis1
     return $ eventToSignal $ changesD dis
   r @?= [[], [0], [4], [15]]
+
+test_apDiscrete1 = do
+  r <- networkToListGC 4 $ do
+    ev0 <- eventFromList [[], [], [2::Int], [3,4]]
+    ev1 <- eventFromList [[-1], [7], [], [11]]
+    dis0 <- accumD 1 $ const <$> ev0
+    dis1 <- accumD 1 $ const <$> ev1
+    let dis = (*) <$> dis0 <*> dis1
+    return $ discreteToSignal dis
+  r @?= [-1, 7, 14, 44]
 
 test_eventFromList = do
   r <- networkToListGC 3 $ do
