@@ -781,11 +781,46 @@ signalToEvent (Sig sigprio sig) = Evt prio $ unsafeCache $ do
         ++ "; noccs=" ++ show (length occs)
       when (not $ null occs) $ trigger occs
 
+applySE :: Signal (a -> b) -> Event a -> Event  b
+applySE (Sig fprio fun) arg@(Evt aprio _)
+    = Evt prio $ debugFrame "applySE" $ transparentMemoE $ do
+  (pullpush, trigger, key) <- newEventInit
+  funPull <- fun
+  let
+    upd mode occs = do
+      debug $ "applySE; prio=" ++ show prio
+      funVal <- funPull
+      trigger mode $ map funVal occs
+  listenToEvent key arg prio $ \mode occs -> do
+    debug $ "applySE: prio=" ++ show prio
+    registerUpd prio $ upd mode occs
+  return pullpush
+  where
+    srcprio = max fprio aprio
+    prio = nextPrio srcprio
+
 ----------------------------------------------------------------------
 -- discretes and signals
 
 discreteToSignal :: Discrete a -> Signal a
 discreteToSignal (Dis prio dis) = Sig prio $ fst <$> dis
+
+----------------------------------------------------------------------
+-- classes
+
+class TimeFunction s where
+  toSignal :: s a -> Signal a
+
+instance TimeFunction Signal where
+  toSignal = id
+
+instance TimeFunction Discrete where
+  toSignal = discreteToSignal
+
+infixl 4 <@> -- same as <$> and <*>
+
+(<@>) :: (TimeFunction s) => s (a -> b) -> Event a -> Event b
+f <@> a = applySE (toSignal f) a
 
 ----------------------------------------------------------------------
 -- utils
@@ -865,6 +900,7 @@ _unitTest = runTestTT $ test
   , test_generatorE
   , test_accumE
   , test_fmapSignal
+  , test_applySE
   ]
 
 test_signalFromList = do
@@ -1008,5 +1044,12 @@ test_fmapSignal = do
       modifyRef ref (+1)
       return $ succ c
     comb x y = [x, y]
+
+test_applySE = do
+  r <- networkToListGC 3 $ do
+    evt <- eventFromList ["ab", "", "c"]
+    sig <- signalFromList [0, 1, 2::Int]
+    return $ eventToSignal $ (,) <$> sig <@> evt
+  r @?= [[(0, 'a'), (0, 'b')], [], [(2, 'c')]]
 
 -- vim: sw=2 ts=2 sts=2
