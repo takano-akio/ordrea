@@ -299,20 +299,22 @@ type Pull a = Run a
 newCachedPull :: Initialize (Run a) -> SignalGen (Pull a)
 newCachedPull gencalc = do
   actionRef <- newRef (error "newCachedPull: not initialized")
-  registerInit $ writeRef actionRef =<< mkpull =<< gencalc
+  registerInit $ writeRef actionRef =<< primStepMemo =<< gencalc
   return $ join $ readRef actionRef
-  where
-    mkpull calc = do
-      ref <- newRef Nothing
-      return $ do
-        cache <- readRef ref
-        case cache of
-          Just val -> return val
-          Nothing -> do
-            val <- calc
-            writeRef ref (Just val)
-            registerFini $ writeRef ref Nothing
-            return val
+
+-- | Cache a @Pull@. The underlyng @Pull@ will be called at most once per step.
+primStepMemo :: Pull a -> Initialize (Pull a)
+primStepMemo pull = do
+  cacheRef <- newRef Nothing
+  return $ do
+    cache <- readRef cacheRef
+    case cache of
+      Just val -> return val
+      Nothing -> do
+        val <- pull
+        writeRef cacheRef (Just val)
+        registerFini $ writeRef cacheRef Nothing
+        return val
 
 ----------------------------------------------------------------------
 -- common push-pull operations
@@ -377,20 +379,6 @@ primMemoDiscrete prio (pull, notifier) =
       debug $ "primMemo: reading from cache: prio=" ++ show prio
       readRef cacheRef
   return (readCache, notifier)
-
--- | Cache a @Pull@. The underlyng @Pull@ will be called at most once per step.
-primStepMemo :: Pull a -> Initialize (Pull a)
-primStepMemo pull = do
-  cacheRef <- newRef Nothing
-  return $ do
-    cache <- readRef cacheRef
-    case cache of
-      Just val -> return val
-      Nothing -> do
-        val <- pull
-        writeRef cacheRef (Just val)
-        registerFini $ writeRef cacheRef Nothing
-        return val
 
 listenToPullPush
   :: WeakKey
