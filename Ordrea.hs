@@ -254,32 +254,26 @@ isolatingUpdates action = do
 ----------------------------------------------------------------------
 -- push
 
-type Notifier = Priority -> Weak (Run ()) -> IO ()
+type Notifier = Weak (Run ()) -> IO ()
 
-listenToNotifier :: WeakKey -> Notifier -> Priority -> Run () -> Initialize ()
-listenToNotifier key push prio handler = do
+listenToNotifier :: WeakKey -> Notifier -> Run () -> Initialize ()
+listenToNotifier key push handler = do
   frm <- debugGetFrame
   weak <- liftIO $ mkWeakWithKey key (debugPutFrame "notifier" frm handler)
-  liftIO $ push prio weak
+  liftIO $ push weak
 
 newNotifier :: IO (Notifier, Run ())
 newNotifier = do
-  listenersRef <- newRef M.empty
+  listenersRef <- newRef []
   return (register listenersRef, invoke listenersRef)
   where
-    register ref listenerPrio listenerWeak = do
-      listenerMap <- readRef ref
-      writeRef ref $! M.alter (add listenerWeak) listenerPrio listenerMap
-    add weak = Just . (weak:) . fromMaybe []
+    register ref listenerWeak = modifyRef ref (listenerWeak:)
 
     invoke ref = do
-      m <- readRef ref
-      m' <- M.fromList . catMaybes <$> mapM run (M.toList m)
-      writeRef ref m'
+      weaks <- readRef ref
+      weaks' <- catMaybes <$> mapM run1 weaks
+      writeRef ref weaks'
       where
-        run (prio, weaks) = do
-          weaks' <- catMaybes <$> mapM run1 weaks
-          return $! if null weaks' then Nothing else Just (prio, weaks')
         run1 weak = do
           m <- liftIO $ deRefWeak weak
           case m of
@@ -289,7 +283,7 @@ newNotifier = do
             Nothing -> return Nothing
 
 emptyNotifier :: Notifier
-emptyNotifier _prio _weak = return ()
+emptyNotifier _weak = return ()
 
 ----------------------------------------------------------------------
 -- pull
@@ -370,15 +364,12 @@ primMemoDiscrete
 primMemoDiscrete prio (pull, notifier) =
     debugFrame ("primMemo[prio=" ++ show prio ++ "]") $ do
   debug $ "primMemo: new"
-  cacheRef <- newRef $ error $ "primMemo: cache not initialized; prio=" ++ show prio
-  listenToPullPush (WeakKey cacheRef) pull notifier prio $ \_mode val -> do
+  (pullpush, set, key)
+    <- newDiscreteInit $ error $ "primMemo: cache not initialized; prio=" ++ show prio
+  listenToPullPush key pull notifier prio $ \mode val -> do
     debug $ "primMemo: writing to cache: prio=" ++ show prio
-    writeRef cacheRef val
-  let
-    readCache = do
-      debug $ "primMemo: reading from cache: prio=" ++ show prio
-      readRef cacheRef
-  return (readCache, notifier)
+    set mode val
+  return pullpush
 
 listenToPullPush
   :: WeakKey
@@ -390,7 +381,7 @@ listenToPullPush
 listenToPullPush key pull notifier prio handler = do
   registerFirstStep $ registerUpd prio $ handler Pull =<< pull
     -- ^ use pull for the first step
-  listenToNotifier key notifier prio $ handler Push =<< pull
+  listenToNotifier key notifier $ handler Push =<< pull
     -- ^ use push for the subsequent steps
 
 ----------------------------------------------------------------------
@@ -511,7 +502,7 @@ dropStepE (Evt evtprio evt) = do
   -- here we manually do the latter half of listenToPullPush
   registerInit $ do
     (getoccs, evtnotifier) <- evt
-    listenToNotifier key evtnotifier prio $ do
+    listenToNotifier key evtnotifier $ do
       occs <- getoccs
       when (not $ null occs) $ trigger Push occs
 
@@ -682,7 +673,7 @@ delayS initial ~(Sig _sigprio sig) = do
   registerInit $ do
     clock <- getClock
     pull <- sig
-    listenToNotifier (WeakKey ref) clock prio $ do
+    listenToNotifier (WeakKey ref) clock $ do
       newVal <- pull
       registerFini $ writeRef ref newVal
   return $ Sig prio $ return $ readRef ref
@@ -727,7 +718,7 @@ changesD :: Discrete a -> Event a
 changesD (Dis disprio dis) = Evt prio $ unsafeOnce $ do
   (pullpush, trigger, key) <- newEventInit
   (dispull, notifier) <- dis
-  listenToNotifier key notifier prio $ trigger Push . (:[]) =<< dispull
+  listenToNotifier key notifier $ trigger Push . (:[]) =<< dispull
   return pullpush
   where
     prio = nextPrio disprio
@@ -759,7 +750,7 @@ signalToEvent (Sig sigprio sig) = Evt prio $ unsafeCache $ do
     -- than the original pull, is alive.
   clock <- getClock
   registerFirstStep $ registerUpd prio $ onclock sigpull (trigger Pull)
-  listenToNotifier key clock prio $ onclock sigpull (trigger Push)
+  listenToNotifier key clock $ onclock sigpull (trigger Push)
   return pullpush
   where
     prio = nextPrio sigprio
