@@ -71,7 +71,7 @@ type Consumer a = a -> IO ()
 -- callback modes
 
 data CallbackMode = Pull | Push
-  deriving (Eq)
+  deriving (Eq, Show)
 
 whenPush :: CallbackMode -> Run () -> Run ()
 whenPush Push x = x
@@ -193,6 +193,16 @@ runInit parentLoc clock i = do
       }
   result <- runReaderT i ienv
   return (result, runAccumF)
+
+-- | Creates a function that runs an @Initialize@ action inside @Run@,
+-- using @loc@ as the parent location.
+makeSubinitializer :: Location -> Initialize (Initialize a -> Run a)
+makeSubinitializer loc = do
+  clock <- getClock
+  return $ \sub -> do
+    (result, first) <- liftIO $ runInit loc clock sub
+    isolatingUpdates $ debugFrame "makeSubInit.first" first
+    return result
 
 ----------------------------------------------------------------------
 -- Run monad
@@ -613,6 +623,30 @@ listenToDiscrete key (Dis _ dis) prio handler = do
   (disPull, disNot) <- dis
   listenToPullPush key disPull disNot prio handler
 
+joinDD :: Discrete (Discrete a) -> SignalGen (Discrete a)
+joinDD outer@(Dis _outerprio _) = do
+  -- TODO: ordering check
+  here <- genLocation
+  let prio = bottomPrio here
+  outerRef <- newRef $ error "joinDD: outerRef not initialized"
+  (push, trigger) <- liftIO newNotifier
+  registerInit $ do
+    runSubinit <- makeSubinitializer here
+    listenToDiscrete (WeakKey outerRef) outer prio $ \outerMode inner -> do
+      debug $ "joinDD: outer; mode=" ++ show outerMode
+      innerRef <- newRef $ error "joinDD: innerRef not initialized"
+      writeRef outerRef innerRef
+      runSubinit $ do
+        listenToDiscrete (WeakKey innerRef) inner prio $ \innerMode val -> do
+          currentInnerRef <- readRef outerRef
+          when (currentInnerRef == innerRef) $ do
+            debug $ "joinDD: inner; mode=" ++ show innerMode
+            writeRef innerRef val
+            case (outerMode, innerMode) of
+              (Pull, Pull) -> return ()
+              _ -> trigger
+  return $ Dis prio $ return (readRef outerRef >>= readRef, push)
+
 ----------------------------------------------------------------------
 -- signals
 
@@ -657,13 +691,11 @@ joinS ~(Sig _sigsigprio sigsig) = do
   let prio = bottomPrio here
   pull <- newCachedPull $ do
     debug $ "joinS: making pull; prio=" ++ show prio
-    parLoc <- getParentLocation
-    clock <- getClock
+    runSubinit <- makeSubinitializer here
     sigpull <- sigsig
     return $ debugFrame ("joinS.pull[prio=" ++ show prio ++ "]") $ do
       Sig _sigprio sig <- sigpull
-      (pull, first) <- liftIO $ runInit parLoc clock sig
-      isolatingUpdates $ debugFrame "fist-step" first
+      pull <- runSubinit sig
       debugFrame "pull" pull
   return $! Sig prio $ return pull
 
@@ -1030,5 +1062,21 @@ test_applySE = do
     sig <- signalFromList [0, 1, 2::Int]
     return $ eventToSignal $ (,) <$> sig <@> evt
   r @?= [[(0, 'a'), (0, 'b')], [], [(2, 'c')]]
+
+test_joinDD = do
+  r <- networkToList 5 net
+  r1 <- networkToListGC 5 net
+  r @?= ["0a", "1b", "1b", "1c", "0d"]
+  r1 @?= r
+  where
+    net = do
+      inner0 <- discrete "0a" [[], ["0b"], [], ["0c"], ["0d"]]
+      inner1 <- discrete "1a" [[], ["1b"], [], ["1c"], ["1d"]]
+      outer <- discrete inner0 [[], [inner1], [], [], [inner0]]
+      discreteToSignal <$> joinDD outer
+
+    discrete initial list = do
+      evt <- eventFromList list
+      accumD initial $ const <$> evt
 
 -- vim: sw=2 ts=2 sts=2
