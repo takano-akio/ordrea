@@ -307,29 +307,49 @@ newCachedPull gencalc = do
   registerInit $ writeRef actionRef =<< primStepMemo =<< gencalc
   return $ join $ readRef actionRef
 
--- | Cache a @Pull@. The underlyng @Pull@ will be called at most once per step.
+-- Caching and memoization
+--
+-- In this module, the terms 'caching' and 'memoization' refer to two different
+-- things:
+--
+-- * Caching is a state manipulation to make sure that a node has only one
+--   copy of its internal state, even if it's referenced from multiple places.
+-- * Memoization is a state manipulation to avoid calculatig the same value
+--   twice, even if it's repeatedly queried. For example,
+--   in the expression (f <$> d) where d is a Discrete, it's important not to
+--   call f multiple times when the value of d hasn't changed.
+--
+-- In general, omitting caching is safe if the node is referenced from only
+-- one place, but ommitting memoization is only safe if it has just one consumer
+-- AND that consumer only asks the current value when the value has been updated
+-- since the last read.
+
+-- | Memoize a @Pull@. The underlyng @Pull@ will be called at most once per step.
 primStepMemo :: Pull a -> Initialize (Pull a)
 primStepMemo pull = do
-  cacheRef <- newRef Nothing
+  memoRef <- newRef Nothing
   return $ do
-    cache <- readRef cacheRef
-    case cache of
+    memo <- readRef memoRef
+    case memo of
       Just val -> return val
       Nothing -> do
         val <- pull
-        writeRef cacheRef (Just val)
-        registerFini $ writeRef cacheRef Nothing
+        writeRef memoRef (Just val)
+        registerFini $ writeRef memoRef Nothing
         return val
 
 ----------------------------------------------------------------------
 -- common push-pull operations
 
-unsafeOnce :: Initialize a -> Initialize a
-unsafeOnce = unsafeCache
-
 unsafeProtectFromDup :: (a -> Initialize a) -> Initialize a -> Initialize a
 unsafeProtectFromDup protect base = unsafeCache (base >>= protect)
 
+-- | @unsafeCache a@ is an idempotent initialization action made from @a@.
+-- When it's run for the first time, @a@ is executed. For subsequent executions
+-- the return value from the first call will be returned without causing
+-- any effects.
+--
+-- Note that this function is not referentially transparent.
 unsafeCache :: Initialize a -> Initialize a
 unsafeCache action = do
   cache <- readRef cacheRef
@@ -366,7 +386,7 @@ transparentMemoE orig = unsafeProtectFromDup memo orig
 transparentMemoS :: Initialize (Pull a) -> Initialize (Pull a)
 transparentMemoS orig = unsafeProtectFromDup primStepMemo orig
 
--- | Cache a @Discrete@. The underlyng @Pull@ will be called at most once per
+-- | Memoize a @Discrete@. The underlyng @Pull@ will be called at most once per
 -- notification.
 primMemoDiscrete
   :: Priority
@@ -475,7 +495,7 @@ generatorE evt = do
 
 mergeEvents :: [Event a] -> Event a
 mergeEvents [] = emptyEvent
-mergeEvents evts = Evt prio $ unsafeOnce $ do
+mergeEvents evts = Evt prio $ unsafeCache $ do
   (pullpush, trigger, key) <- newEventInit
   occListRef <- newRef []
   let
@@ -774,7 +794,7 @@ accumD initial evt@(~(Evt evtprio _)) = do
     prio = nextPrio evtprio
 
 changesD :: Discrete a -> Event a
-changesD (Dis disprio dis) = Evt prio $ unsafeOnce $ do
+changesD (Dis disprio dis) = Evt prio $ unsafeCache $ do
   (pullpush, trigger, key) <- newEventInit
   (dispull, notifier) <- dis
   listenToNotifier key notifier $ trigger Push . (:[]) =<< dispull
