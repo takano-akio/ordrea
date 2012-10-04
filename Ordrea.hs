@@ -943,6 +943,8 @@ _unitTest = runTestTT $ test
   , test_accumE
   , test_fmapSignal
   , test_applySE
+  , test_joinDD
+  , test_joinDE
   ]
 
 test_signalFromList = do
