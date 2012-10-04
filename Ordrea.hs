@@ -230,9 +230,10 @@ runUpdates = debugFrame "runUpdates" $ asks envPendingUpdates >>= loop
   where
     loop pqueueRef = do
       pending <- readRef pqueueRef
-      case M.minView pending of
+      case M.minViewWithKey pending of
         Nothing -> return ()
-        Just (upd, next) -> do
+        Just ((prio, upd), next) -> do
+          debug $ "running updates with prio " ++ show prio
           writeRef pqueueRef next
           upd :: Run ()
           loop pqueueRef
@@ -865,15 +866,19 @@ newActionAccum = do
 debug :: (MonadIO m) => String -> m ()
 debug str = when debugTraceEnabled $ liftIO $ do
   stack <- readRef debugStackRef
-  putStrLn $ str ++ " -- " ++ intercalate "," stack
+  debugPrintWith (length stack) ('-':str)
 
 debugStackRef :: IORef [String]
 debugStackRef = unsafePerformIO $ newRef []
 {-# NOINLINE debugStackRef #-}
 
+debugPrintWith :: (MonadIO m) => Int -> String -> m ()
+debugPrintWith level msg = liftIO $ putStrLn $ replicate level ' ' ++ msg
+
 debugFrame :: (MonadIO m) => String -> m a -> m a
 debugFrame loc body = if not debugTraceEnabled then body else do
   oldStack <- readRef debugStackRef
+  debugPrintWith (length oldStack) loc
   writeRef debugStackRef (loc:oldStack)
   val <- body
   writeRef debugStackRef oldStack
