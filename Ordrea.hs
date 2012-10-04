@@ -783,7 +783,7 @@ signalToEvent (Sig sigprio sig) = Evt prio $ unsafeCache $ do
     -- than the original pull, is alive.
   clock <- getClock
   registerFirstStep $ registerUpd prio $ onclock sigpull (trigger Pull)
-  listenToNotifier key clock $ onclock sigpull (trigger Push)
+  listenToNotifier key clock $ registerUpd prio $ onclock sigpull (trigger Push)
   return pullpush
   where
     prio = nextPrio sigprio
