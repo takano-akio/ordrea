@@ -648,6 +648,32 @@ joinDD outer@(Dis _outerprio _) = do
               _ -> trigger
   return $ Dis prio $ return (readRef outerRef >>= readRef, push)
 
+joinDE :: Discrete (Event a) -> SignalGen (Event a)
+joinDE outer@(Dis _outerprio _) = do
+  -- TODO: ordering check
+  here <- genLocation
+  let prio = bottomPrio here
+  outerRef <- newRef $ error "joinDE: outerRef not initialized"
+  (push, trigger) <- liftIO newNotifier
+  registerInit $ do
+    runSubinit <- makeSubinitializer here
+    listenToDiscrete (WeakKey outerRef) outer prio $ \outerMode inner -> do
+      debug $ "joinDE: outer; mode=" ++ show outerMode
+      innerRef <- newRef []
+      writeRef outerRef innerRef
+      runSubinit $ do
+        listenToEvent (WeakKey innerRef) inner prio $ \innerMode occs -> do
+          currentInnerRef <- readRef outerRef
+          when (currentInnerRef == innerRef) $ do
+            debug $ "joinDE: inner; mode=" ++ show innerMode
+              ++ "; noccs=" ++ show (length occs)
+            writeRef innerRef occs
+            registerFini $ writeRef innerRef []
+            case (outerMode, innerMode) of
+              (Pull, Pull) -> return ()
+              _ -> trigger
+  return $ Evt prio $ return (readRef outerRef >>= readRef, push)
+
 ----------------------------------------------------------------------
 -- signals
 
@@ -1079,6 +1105,22 @@ test_joinDD = do
       inner1 <- discrete "1a" [[], ["1b"], [], ["1c"], ["1d"]]
       outer <- discrete inner0 [[], [inner1], [], [], [inner0]]
       discreteToSignal <$> joinDD outer
+
+    discrete initial list = do
+      evt <- eventFromList list
+      accumD initial $ const <$> evt
+
+test_joinDE = do
+  r <- networkToList 5 net
+  r1 <- networkToListGC 5 net
+  r @?= [[], ["1b"], [], ["1c"], ["0d"]]
+  r1 @?= r
+  where
+    net = do
+      inner0 <- eventFromList [[], ["0b"], [], ["0c"], ["0d"]]
+      inner1 <- eventFromList [[], ["1b"], [], ["1c"], ["1d"]]
+      outer <- discrete inner0 [[], [inner1], [], [], [inner0]]
+      eventToSignal <$> joinDE outer
 
     discrete initial list = do
       evt <- eventFromList list
