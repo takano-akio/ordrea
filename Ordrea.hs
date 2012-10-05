@@ -993,6 +993,7 @@ _unitTest = runTestTT $ test
   , test_preservesD
   , test_joinS
   , test_generatorE
+  , test_generatorE1
   , test_accumE
   , test_fmapSignal
   , test_applySE
@@ -1117,6 +1118,17 @@ test_generatorE = do
     subnet1 = signalFromList [11, 12, 13, 14]
     subnet2 = signalFromList [21, 22, 23, 24]
     subnet3 = signalFromList [31, 32, 33, 34]
+
+test_generatorE1 = do
+  r <- networkToListGC 4 $ do
+    evEv <- generatorE =<<
+      eventFromList [[subnet 0], [subnet 1, subnet 2], [], [subnet 3]]
+    dEv <- accumD mempty $ const <$> evEv
+    ev <- joinDE dEv
+    return $ eventToSignal ev
+  r @?= [[1], [21], [22, 23], [31]]
+  where
+    subnet k = fmap (10*k+) <$> eventFromList [[1], [2,3], [], [4::Int]]
 
 test_accumE = do
   r <- networkToList 3 $ do
