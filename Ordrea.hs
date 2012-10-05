@@ -1,7 +1,25 @@
 {-# LANGUAGE DeriveFunctor, GeneralizedNewtypeDeriving, ExistentialQuantification #-}
 {-# OPTIONS_GHC -Wall #-}
 {-# OPTIONS_GHC -fno-warn-missing-signatures #-}
-module Ordrea where
+module Ordrea
+  ( SignalGen
+  , Signal, Event, Discrete
+
+  , generatorE, filterE, stepClockE, dropStepE, eventFromList, accumE
+
+  , joinDD, joinDE, joinDS
+
+  , start, externalS, joinS, delayS, signalFromList, networkToList
+  , networkToListGC
+
+  , accumD, changesD, preservesD
+
+  , eventToSignal, signalToEvent, applySE
+
+  , discreteToSignal
+
+  , TimeFunction(..), (<@>)
+  ) where
 
 import Control.Applicative
 import Control.Monad
@@ -179,8 +197,8 @@ registerFirstStep action = do
 getClock :: Initialize Notifier
 getClock = asks envClock
 
-getParentLocation :: Initialize Location
-getParentLocation = asks envParentLocation
+_getParentLocation :: Initialize Location
+_getParentLocation = asks envParentLocation
 
 runInit :: Location -> Notifier -> Initialize a -> IO (a, Run ())
 runInit parentLoc clock i = do
