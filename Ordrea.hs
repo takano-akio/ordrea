@@ -694,6 +694,21 @@ joinDE outer@(Dis _outerprio _) = do
               _ -> trigger
   return $ Evt prio $ return (readRef outerRef >>= readRef, push)
 
+joinDS :: Discrete (Signal a) -> SignalGen (Signal a)
+joinDS outer@(Dis _outerprio _) = do
+  -- TODO: ordering check
+  here <- genLocation
+  let prio = bottomPrio here
+  outerRef <- newRef $ error "joinDS: outerRef not initialized"
+  registerInit $ do
+    runSubinit <- makeSubinitializer here
+    listenToDiscrete (WeakKey outerRef) outer prio
+        $ \_ (Sig _innerprio sig) -> do
+      debug $ "joinDS: outer"
+      pull <- runSubinit sig
+      writeRef outerRef pull
+  return $ Sig prio $ return (readRef outerRef >>= id)
+
 ----------------------------------------------------------------------
 -- signals
 
@@ -965,6 +980,7 @@ _unitTest = runTestTT $ test
   , test_applySE
   , test_joinDD
   , test_joinDE
+  , test_joinDS
   ]
 
 test_signalFromList = do
@@ -1143,6 +1159,22 @@ test_joinDE = do
       inner1 <- eventFromList [[], ["1b"], [], ["1c"], ["1d"]]
       outer <- discrete inner0 [[], [inner1], [], [], [inner0]]
       eventToSignal <$> joinDE outer
+
+    discrete initial list = do
+      evt <- eventFromList list
+      accumD initial $ const <$> evt
+
+test_joinDS = do
+  r <- networkToList 4 net
+  r1 <- networkToListGC 4 net
+  r @?= ["0a", "1b", "1c", "0d"]
+  r1 @?= r
+  where
+    net = do
+      inner0 <- signalFromList ["0a", "0b", "0c", "0d"]
+      inner1 <- signalFromList ["1a", "1b", "1c", "1d"]
+      outer <- discrete inner0 [[], [inner1], [], [inner0]]
+      joinDS outer
 
     discrete initial list = do
       evt <- eventFromList list
