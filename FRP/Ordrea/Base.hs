@@ -1,7 +1,7 @@
 {-# LANGUAGE DeriveFunctor, GeneralizedNewtypeDeriving, ExistentialQuantification #-}
 {-# OPTIONS_GHC -Wall #-}
 {-# OPTIONS_GHC -fno-warn-missing-signatures #-}
-module Ordrea
+module FRP.Ordrea.Base
   ( SignalGen
   , Signal, Event, Discrete
 
@@ -40,7 +40,7 @@ import System.Mem (performGC)
 import System.Mem.Weak
 import Test.HUnit
 
-import Weak
+import FRP.Ordrea.Weak
 
 -- Phases
 --

@@ -6,7 +6,7 @@
 -- If you use ghci, compile this file first and then
 -- load the .o file to ghci.
 
-module Weak (mkWeakWithIORef) where
+module FRP.Ordrea.Weak (mkWeakWithIORef) where
 
 import GHC.Exts
 import GHC.IO
