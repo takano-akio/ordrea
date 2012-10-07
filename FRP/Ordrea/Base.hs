@@ -6,6 +6,7 @@ module FRP.Ordrea.Base
   , Signal, Event, Discrete
 
   , generatorE, filterE, stepClockE, dropStepE, eventFromList, accumE
+  , mapMaybeE, justE, flattenE, expandE
 
   , joinDD, joinDE, joinDS
 
@@ -575,6 +576,18 @@ accumE initial evt@(~(Evt evtprio _)) = do
   return myevt
   where
     prio = nextPrio evtprio
+
+mapMaybeE :: (a -> Maybe b) -> Event a -> Event b
+mapMaybeE f = transformEvent (mapMaybe f)
+
+justE :: Event (Maybe a) -> Event a
+justE = transformEvent catMaybes
+
+flattenE :: Event [a] -> Event a
+flattenE = transformEvent concat
+
+expandE :: Event a -> Event [a]
+expandE = transformEvent1 (:[])
 
 ----------------------------------------------------------------------
 -- discretes
