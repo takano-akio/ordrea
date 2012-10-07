@@ -429,9 +429,9 @@ listenToPullPush
   -> Initialize ()
 listenToPullPush key pull notifier prio handler = do
   registerFirstStep $ registerUpd prio $ handler Pull =<< pull
-    -- ^ use pull for the first step
+    --- ^ use pull for the first step
   listenToNotifier key notifier $ handler Push =<< pull
-    -- ^ use push for the subsequent steps
+    --- ^ use push for the subsequent steps
 
 ----------------------------------------------------------------------
 -- events
@@ -856,7 +856,7 @@ signalToEvent (Sig sigprio sig) = Evt prio $ unsafeCache $ do
   debug "signalToEvent"
   sigpull <- sig
   (pullpush, trigger, key) <- newEventInit
-    -- ^ Here we create a fresh event, even though its pull component
+    --- ^ Here we create a fresh event, even though its pull component
     -- will be identical to sigpull. This is because we want a new key
     -- to keep the new notifier alive as long as the new pull, rather
     -- than the original pull, is alive.
