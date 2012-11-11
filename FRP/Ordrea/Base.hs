@@ -1,4 +1,4 @@
-{-# LANGUAGE DeriveFunctor, GeneralizedNewtypeDeriving, ExistentialQuantification #-}
+{-# LANGUAGE DeriveFunctor, GeneralizedNewtypeDeriving, ExistentialQuantification, DeriveDataTypeable #-}
 {-# OPTIONS_GHC -Wall #-}
 {-# OPTIONS_GHC -fno-warn-missing-signatures #-}
 module FRP.Ordrea.Base
@@ -23,7 +23,9 @@ module FRP.Ordrea.Base
   ) where
 
 import Control.Applicative
+import Control.Exception
 import Control.Monad
+import Control.Monad.Fix
 import Control.Monad.IO.Class
 import Control.Monad.Trans.Class
 import Control.Monad.Trans.Reader
@@ -34,6 +36,7 @@ import qualified Data.Map as M
 import Data.Maybe
 import Data.Monoid
 import Data.Ord (comparing)
+import Data.Typeable
 import qualified Data.Vector.Unboxed as U
 import Data.Word
 import System.IO.Unsafe
@@ -75,7 +78,7 @@ import FRP.Ordrea.Weak
 --   circuit.
 
 newtype SignalGen a = SignalGen (ReaderT GEnv IO a)
-  deriving (Monad, Functor, Applicative, MonadIO)
+  deriving (Monad, Functor, Applicative, MonadIO, MonadFix)
 type Initialize = ReaderT IEnv IO
 type Run = ReaderT REnv IO
 type Finalize = IO
@@ -114,6 +117,11 @@ instance Show Priority where
   show Priority{priLoc = loc, priNum = num} =
     show (U.toList loc) ++ "/" ++ show num
 
+data OrderingViolation = OrderingViolation String
+  deriving (Show, Typeable)
+
+instance Exception OrderingViolation
+
 nextPrio :: Priority -> Priority
 nextPrio prio@Priority{priNum=n} = prio{ priNum = n + 1 }
 
@@ -133,6 +141,14 @@ newLocationGen parentLoc = do
     num <- readRef counter
     writeRef counter $! num + 1
     return $! parentLoc `U.snoc` num
+
+-- Check the ordering condition.
+shouldBeGreaterThan :: Priority -> Priority -> Initialize ()
+shouldBeGreaterThan x y = do
+  debug $ "shouldBeGreaterThan: " ++ msg
+  unless (x > y) $ liftIO $ throwIO $ OrderingViolation msg
+  where
+    msg = show (x, y)
 
 ----------------------------------------------------------------------
 -- weak pointers
@@ -451,7 +467,8 @@ listenToEvent
   -> Priority
   -> (CallbackMode -> [a] -> Run ())
   -> Initialize ()
-listenToEvent key (Evt _ evt) prio handler = debugFrame "listenToEvent" $ do
+listenToEvent key (Evt evtprio evt) prio handler = debugFrame "listenToEvent" $ do
+  prio `shouldBeGreaterThan` evtprio
   (evtPull, evtNot) <- evt
   listenToPullPush key evtPull evtNot prio $ \mode occs ->
     when (not $ null occs) $ handler mode occs
@@ -546,7 +563,7 @@ stepClockE = Evt (bottomPrio bottomLocation) $ do
   return (pure [()], clock)
 
 dropStepE :: Event a -> SignalGen (Event a)
-dropStepE (Evt evtprio evt) = do
+dropStepE ~(Evt evtprio evt) = do
   (result, trigger, key) <- newEventSG prio
 
   -- here we manually do the latter half of listenToPullPush
@@ -671,18 +688,19 @@ listenToDiscrete
   -> Priority
   -> (CallbackMode -> a -> Run ())
   -> Initialize ()
-listenToDiscrete key (Dis _ dis) prio handler = do
+listenToDiscrete key (Dis disprio dis) prio handler = do
+  prio `shouldBeGreaterThan` disprio
   (disPull, disNot) <- dis
   listenToPullPush key disPull disNot prio handler
 
 joinDD :: Discrete (Discrete a) -> SignalGen (Discrete a)
-joinDD outer@(Dis _outerprio _) = do
-  -- TODO: ordering check
+joinDD outer@ ~(Dis outerprio _) = do
   here <- genLocation
   let prio = bottomPrio here
   outerRef <- newRef $ error "joinDD: outerRef not initialized"
   (push, trigger) <- liftIO newNotifier
   registerInit $ do
+    prio `shouldBeGreaterThan` outerprio
     runSubinit <- makeSubinitializer here
     listenToDiscrete (WeakKey outerRef) outer prio $ \outerMode inner -> do
       debug $ "joinDD: outer; mode=" ++ show outerMode
@@ -700,13 +718,13 @@ joinDD outer@(Dis _outerprio _) = do
   return $ Dis prio $ return (readRef outerRef >>= readRef, push)
 
 joinDE :: Discrete (Event a) -> SignalGen (Event a)
-joinDE outer@(Dis _outerprio _) = do
-  -- TODO: ordering check
+joinDE outer@ ~(Dis outerprio _) = do
   here <- genLocation
   let prio = bottomPrio here
   outerRef <- newRef $ error "joinDE: outerRef not initialized"
   (push, trigger) <- liftIO newNotifier
   registerInit $ do
+    prio `shouldBeGreaterThan` outerprio
     runSubinit <- makeSubinitializer here
     listenToDiscrete (WeakKey outerRef) outer prio $ \outerMode inner -> do
       debug $ "joinDE: outer; mode=" ++ show outerMode
@@ -726,17 +744,19 @@ joinDE outer@(Dis _outerprio _) = do
   return $ Evt prio $ return (readRef outerRef >>= readRef, push)
 
 joinDS :: Discrete (Signal a) -> SignalGen (Signal a)
-joinDS outer@(Dis _outerprio _) = do
-  -- TODO: ordering check
+joinDS outer@ ~(Dis outerprio _) = do
   here <- genLocation
   let prio = bottomPrio here
   outerRef <- newRef $ error "joinDS: outerRef not initialized"
   registerInit $ do
+    prio `shouldBeGreaterThan` outerprio
     runSubinit <- makeSubinitializer here
     listenToDiscrete (WeakKey outerRef) outer prio
-        $ \_ (Sig _innerprio sig) -> do
+        $ \_ (Sig innerprio sig) -> do
       debug $ "joinDS: outer"
-      pull <- runSubinit sig
+      pull <- runSubinit $ do
+        prio `shouldBeGreaterThan` innerprio
+        sig
       writeRef outerRef pull
   return $ Sig prio $ return (readRef outerRef >>= id)
 
@@ -1013,6 +1033,8 @@ _unitTest = runTestTT $ test
   , test_joinDD
   , test_joinDE
   , test_joinDS
+  , test_mfix
+  , test_orderingViolation_joinDS
   ]
 
 test_signalFromList = do
@@ -1222,5 +1244,36 @@ test_joinDS = do
     discrete initial list = do
       evt <- eventFromList list
       accumD initial $ const <$> evt
+
+test_mfix = do
+  r <- networkToList 3 net
+  r @?= [1, 6, 30]
+  where
+    net = fmap snd $ mfix $ \ ~(e', _) -> do
+      r <- accumD 1 $ (*) <$> e'
+      e <- eventFromList [[], [2,3], [5::Int]]
+      return (e, discreteToSignal r)
+
+test_orderingViolation_joinDS = do
+  g <- start net
+  g >>= (@?=(0::Int))
+  g >>= (@?=1)
+  shouldThrowOrderingViolation g
+  where
+    net = fmap snd $ mfix $ \ ~(sd', _) -> do
+      s <- joinDS sd'
+      se <- eventFromList [[], [pure 1], [s]]
+      sd <- accumD (pure 0) $ const <$> se
+      return (sd, s)
+
+shouldThrowOrderingViolation :: IO a -> Assertion
+shouldThrowOrderingViolation x = do
+  r <- f <$> try x
+  r @?= True
+  where
+    f (Left e)
+      | Just (OrderingViolation _) <- fromException e
+      = True
+    f _ = False
 
 -- vim: sw=2 ts=2 sts=2
