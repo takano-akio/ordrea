@@ -71,7 +71,7 @@ import FRP.Ordrea.Weak
 -- * Execution step (Run monad)
 --   This phase updates internal states of the network, moving the
 --   computation one step forward.
--- * Finalization step (Finalize monad)
+-- * Clean-up step (Cleanup monad)
 --   This phase comes after each execution step. The 'current state' of
 --   an event node is reset to [] in this phase.
 --
@@ -90,7 +90,7 @@ newtype SignalGen a = SignalGen (ReaderT GEnv IO a)
   deriving (Monad, Functor, Applicative, MonadIO, MonadFix)
 type Initialize = ReaderT IEnv IO
 type Run = ReaderT REnv IO
-type Finalize = IO
+type Cleanup = IO
 
 data Signal a   = Sig !Priority !(Initialize (Pull a))
 data Event a    = Evt !Priority !(Initialize (Pull [a], Notifier))
@@ -261,7 +261,7 @@ makeSubinitializer loc = do
 -- Run monad
 
 data REnv = REnv
-  { envRegisterFini :: Consumer (Finalize ())
+  { envRegisterFini :: Consumer (Cleanup ())
   , envPendingUpdates :: IORef (M.Map Priority (Run ())) -- TODO: use heap?
   }
 
