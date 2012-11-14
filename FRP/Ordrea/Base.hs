@@ -181,27 +181,49 @@ deRefWeakLike (WeakLike a) = a
 
 data GEnv = GEnv
   { envRegisterInit :: Consumer (Initialize ())
+  , envRegisterPrep :: Consumer (Run ())
   , envGenLocation :: IO Location
   }
 
-runSignalGen :: Location -> Notifier -> SignalGen a -> IO (a, Run ())
-runSignalGen parentLoc clock (SignalGen gen) = do
+runSignalGen
+  :: Consumer (Run ()) -> Location -> Notifier -> SignalGen a
+  -> IO (a, Run ())
+runSignalGen regPrep parentLoc clock (SignalGen gen) = do
   (registerI, runAccumI) <- newActionAccum
   locGen <- newLocationGen parentLoc
   let
     genv = GEnv
       { envRegisterInit = registerI
+      , envRegisterPrep = regPrep
       , envGenLocation = locGen
       }
   result <- runReaderT gen genv
   (_, runAccumF) <- runInit parentLoc clock runAccumI
   return (result, runAccumF)
 
-runSignalGenInStep :: Location -> Notifier -> SignalGen a -> Run a
-runSignalGenInStep parentLoc clock sgen = debugFrame "SGenInStep" $ do
-  (result, initial) <- liftIO $ runSignalGen parentLoc clock sgen
-  isolatingUpdates initial
-  return result
+runSignalGenInStep :: SignalGen (Location -> Notifier -> SignalGen a -> Run a)
+runSignalGenInStep = do
+  regPrep <- getPreparationAdder
+  return $ \parentLoc clock sgen -> debugFrame "SGenInStep" $ do
+    (result, initial) <- liftIO $ runSignalGen regPrep parentLoc clock sgen
+    isolatingUpdates initial
+    return result
+
+runSignalGenToplevel :: SignalGen (Initialize a) -> IO (a, Run ())
+runSignalGenToplevel gen = do
+  (clock, clockTrigger) <- newNotifier
+  prepVar <- newEmptyMVar
+  (val, initial) <- debugFrame "toplevel" $ do
+    ref <- newRef undefined
+    ((), initial) <- runSignalGen (addToPrep prepVar) bottomLocation clock $ do
+      i <- gen
+      registerInit $ writeRef ref =<< i
+    val <- readRef ref
+    return (val, initial)
+  liftIO $ putMVar prepVar initial
+  return (val, join $ liftIO $ swapMVar prepVar clockTrigger)
+  where
+    addToPrep prepVar x = modifyMVar_ prepVar (\r -> return (x >> r))
 
 genLocation :: SignalGen Location
 genLocation = SignalGen $ do
@@ -213,6 +235,9 @@ registerInit ini = SignalGen $ do
   reg <- asks envRegisterInit
   frm <- debugGetFrame
   lift $ reg $ debugPutFrame "init" frm ini
+
+getPreparationAdder :: SignalGen (Run () -> IO ())
+getPreparationAdder = SignalGen $ asks envRegisterPrep
 
 ----------------------------------------------------------------------
 -- Initialize monad
@@ -571,10 +596,11 @@ generatorE evt = do
   here <- genLocation
   let prio = bottomPrio here
   (result, trigger, key) <- newEventSG prio
+  runSG <- runSignalGenInStep
   registerInit $ do
     clock <- getClock
     listenToEvent key evt prio $ \mode gens ->
-      trigger mode =<< mapM (runSignalGenInStep here clock) gens
+      trigger mode =<< mapM (runSG here clock) gens
   return result
 
 mergeEvents :: [Event a] -> Event a
@@ -824,21 +850,12 @@ instance Applicative Signal where
 
 start :: SignalGen (Signal a) -> IO (IO a)
 start gensig = do
-  (clock, clockTrigger) <- newNotifier
-  (getval, initial) <- debugFrame "toplevel" $ do
-    ref <- newRef undefined
-    ((), initial) <- runSignalGen bottomLocation clock $ do
-      Sig _ sig <- gensig
-      registerInit $ do
-        getval <- sig
-        writeRef ref getval
-    getval <- readRef ref
-    return (getval, initial)
-  initialRef <- newRef initial
+  (getval, prep) <- runSignalGenToplevel $ do
+    Sig _ sig <- gensig
+    return $ sig
   return $ runRun $ debugFrame "step" $ do
     debug "step"
-    isolatingUpdates $ join $ readRef initialRef
-    writeRef initialRef $ clockTrigger
+    isolatingUpdates $ prep
     debugFrame "getval" getval
 
 externalS :: IO a -> SignalGen (Signal a)
