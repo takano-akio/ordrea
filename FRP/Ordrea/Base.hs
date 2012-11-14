@@ -14,7 +14,7 @@ module FRP.Ordrea.Base
   , newExternalEvent, triggerExternalEvent, listenToExternalEvent
 
   , generatorE, filterE, stepClockE, dropStepE, eventFromList, accumE
-  , mapMaybeE, justE, flattenE, expandE
+  , mapMaybeE, justE, flattenE, expandE, externalE
 
   , joinDD, joinDE, joinDS
 
@@ -680,6 +680,24 @@ flattenE = transformEvent concat
 expandE :: Event a -> Event [a]
 expandE = transformEvent1 (:[])
 
+-- | Create a new event that occurs every time the given external event
+-- occurs.
+externalE :: ExternalEvent a -> SignalGen (Event a)
+externalE ee = do
+  occsVar <- liftIO $ newMVar []
+  (evt, trigger, key) <- newEventSG (bottomPrio bottomLocation)
+  addToPrep <- getPreparationAdder
+  handler <- liftIO $ fmap weakToLike $
+    mkWeakWithKey key $ add trigger addToPrep occsVar
+  liftIO $ listenToExternalEvent ee handler
+  return evt
+  where
+    add trigger addToPrep occsVar occ = do
+      firstTime <- modifyMVar occsVar $ \occs -> return (occ:occs, null occs)
+      when firstTime $ addToPrep $ do
+        occs <- liftIO $ swapMVar occsVar []
+        trigger Push $ reverse occs
+
 ----------------------------------------------------------------------
 -- discretes
 
@@ -1101,6 +1119,7 @@ _unitTest = runTestTT $ test
   , test_mfix
   , test_orderingViolation_joinDS
   , test_externalEvent
+  , test_externalE
   ]
 
 test_signalFromList = do
@@ -1343,6 +1362,17 @@ test_externalEvent = do
   readRef ref >>= (@?=["bar"])
   triggerExternalEvent ee "baz"
   readRef ref >>= (@?=["baz", "bar"])
+
+test_externalE = do
+  ee <- newExternalEvent
+  triggerExternalEvent ee "a"
+  g <- start $ eventToSignal <$> externalE ee
+  triggerExternalEvent ee "b"
+  g >>= (@?=["b"])
+  g >>= (@?=[])
+  triggerExternalEvent ee "c"
+  triggerExternalEvent ee "d"
+  g >>= (@?=["c","d"])
 
 shouldThrowOrderingViolation :: IO a -> Assertion
 shouldThrowOrderingViolation x = do
