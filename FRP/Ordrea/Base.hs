@@ -10,6 +10,9 @@ module FRP.Ordrea.Base
   ( SignalGen
   , Signal, Event, Discrete
 
+  , ExternalEvent
+  , newExternalEvent, triggerExternalEvent, listenToExternalEvent
+
   , generatorE, filterE, stepClockE, dropStepE, eventFromList, accumE
   , mapMaybeE, justE, flattenE, expandE
 
@@ -28,6 +31,7 @@ module FRP.Ordrea.Base
   ) where
 
 import Control.Applicative
+import Control.Concurrent.MVar
 import Control.Exception
 import Control.Monad
 import Control.Monad.Fix
@@ -464,6 +468,35 @@ listenToPullPush key pull notifier prio handler = do
     --- ^ use pull for the first step
   listenToNotifier key notifier $ handler Push =<< pull
     --- ^ use push for the subsequent steps
+
+----------------------------------------------------------------------
+-- external events
+
+-- | Push-based asynchronous events.
+newtype ExternalEvent a = ExternalEvent (MVar (NotifierG IO, IO (), IORef a))
+
+eeVoid :: a
+eeVoid = error "bug: ExternalEvent: void"
+
+newExternalEvent :: IO (ExternalEvent a)
+newExternalEvent = do
+  (add, invoke) <- newNotifier
+  ref <- newRef eeVoid
+  ExternalEvent <$> newMVar (add, invoke, ref)
+
+listenToExternalEvent :: ExternalEvent a -> WeakLike (a -> IO ()) -> IO ()
+listenToExternalEvent (ExternalEvent var) handlerW =
+  withMVar var $ \(add, _, ref) -> add $ invoke ref <$> handlerW
+  where
+    invoke ref handler = do
+      val <- readRef ref
+      handler val
+
+triggerExternalEvent :: ExternalEvent a -> a -> IO ()
+triggerExternalEvent (ExternalEvent var) val = withMVar var $ \(_, invoke, ref) -> do
+  writeRef ref val
+  invoke
+  writeRef ref eeVoid
 
 ----------------------------------------------------------------------
 -- events
@@ -1050,6 +1083,7 @@ _unitTest = runTestTT $ test
   , test_joinDS
   , test_mfix
   , test_orderingViolation_joinDS
+  , test_externalEvent
   ]
 
 test_signalFromList = do
@@ -1280,6 +1314,18 @@ test_orderingViolation_joinDS = do
       se <- eventFromList [[], [pure 1], [s]]
       sd <- accumD (pure 0) $ const <$> se
       return (sd, s)
+
+test_externalEvent = do
+  ref <- newRef []
+  ee <- newExternalEvent
+  triggerExternalEvent ee "foo"
+  readRef ref >>= (@?=[])
+  w <- mkWeakWithIORef ref (modifyIORef ref . (:)) Nothing
+  listenToExternalEvent ee (weakToLike w)
+  triggerExternalEvent ee "bar"
+  readRef ref >>= (@?=["bar"])
+  triggerExternalEvent ee "baz"
+  readRef ref >>= (@?=["baz", "bar"])
 
 shouldThrowOrderingViolation :: IO a -> Assertion
 shouldThrowOrderingViolation x = do
