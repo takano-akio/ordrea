@@ -163,6 +163,15 @@ data WeakKey = forall a. WeakKey {-# UNPACK #-} !(IORef a)
 mkWeakWithKey :: WeakKey -> v -> IO (Weak v)
 mkWeakWithKey (WeakKey ref) v = mkWeakWithIORef ref v Nothing
 
+newtype WeakLike a = WeakLike (IO (Maybe a))
+  deriving (Functor)
+
+weakToLike :: Weak a -> WeakLike a
+weakToLike = WeakLike . deRefWeak
+
+deRefWeakLike :: WeakLike a -> IO (Maybe a)
+deRefWeakLike (WeakLike a) = a
+
 ----------------------------------------------------------------------
 -- SignalGen monad
 
@@ -306,13 +315,13 @@ isolatingUpdates action = do
 -- push
 
 type Notifier = NotifierG Run
-type NotifierG m = Weak (m ()) -> IO ()
+type NotifierG m = WeakLike (m ()) -> IO ()
 
 listenToNotifier :: WeakKey -> Notifier -> Run () -> Initialize ()
 listenToNotifier key push handler = do
   frm <- debugGetFrame
   weak <- liftIO $ mkWeakWithKey key (debugPutFrame "notifier" frm handler)
-  liftIO $ push weak
+  liftIO $ push (weakToLike weak)
 
 newNotifier :: (Functor m, MonadIO m) => IO (NotifierG m, m ())
 newNotifier = do
@@ -327,7 +336,7 @@ newNotifier = do
       writeRef ref weaks'
       where
         run1 weak = do
-          m <- liftIO $ deRefWeak weak
+          m <- liftIO $ deRefWeakLike weak
           case m of
             Just listener -> do
               () <- listener
