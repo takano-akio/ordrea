@@ -305,7 +305,8 @@ isolatingUpdates action = do
 ----------------------------------------------------------------------
 -- push
 
-type Notifier = Weak (Run ()) -> IO ()
+type Notifier = NotifierG Run
+type NotifierG m = Weak (m ()) -> IO ()
 
 listenToNotifier :: WeakKey -> Notifier -> Run () -> Initialize ()
 listenToNotifier key push handler = do
@@ -313,7 +314,7 @@ listenToNotifier key push handler = do
   weak <- liftIO $ mkWeakWithKey key (debugPutFrame "notifier" frm handler)
   liftIO $ push weak
 
-newNotifier :: IO (Notifier, Run ())
+newNotifier :: (Functor m, MonadIO m) => IO (NotifierG m, m ())
 newNotifier = do
   listenersRef <- newRef []
   return (register listenersRef, invoke listenersRef)
@@ -329,7 +330,7 @@ newNotifier = do
           m <- liftIO $ deRefWeak weak
           case m of
             Just listener -> do
-              listener :: Run ()
+              () <- listener
               return $ Just weak
             Nothing -> return Nothing
 
