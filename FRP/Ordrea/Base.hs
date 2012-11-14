@@ -361,16 +361,11 @@ newNotifier = do
 
     invoke ref = do
       weaks <- readRef ref
-      weaks' <- catMaybes <$> mapM run1 weaks
+      (weaks', listeners) <- unzip . catMaybes <$> mapM run1 weaks
+      sequence_ $ reverse listeners
       writeRef ref weaks'
       where
-        run1 weak = do
-          m <- liftIO $ deRefWeakLike weak
-          case m of
-            Just listener -> do
-              () <- listener
-              return $ Just weak
-            Nothing -> return Nothing
+        run1 weak = liftIO $ fmap ((,) weak) <$> deRefWeakLike weak
 
 emptyNotifier :: Notifier
 emptyNotifier _weak = return ()
@@ -385,6 +380,21 @@ newCachedPull gencalc = do
   actionRef <- newRef (error "newCachedPull: not initialized")
   registerInit $ writeRef actionRef =<< primStepMemo =<< gencalc
   return $ join $ readRef actionRef
+
+pullFromCache
+  :: IORef (Maybe a)
+  -> Run a
+  -> Run ()
+  -> Pull a
+pullFromCache ref pull onWrite = do
+  cache <- readRef ref
+  case cache of
+    Nothing -> do
+      val <- pull
+      writeRef ref (Just val)
+      onWrite
+      return val
+    Just val -> return val
 
 -- Caching and memoization
 --
@@ -407,15 +417,7 @@ newCachedPull gencalc = do
 primStepMemo :: Pull a -> Initialize (Pull a)
 primStepMemo pull = do
   memoRef <- newRef Nothing
-  return $ do
-    memo <- readRef memoRef
-    case memo of
-      Just val -> return val
-      Nothing -> do
-        val <- pull
-        writeRef memoRef (Just val)
-        registerFini $ writeRef memoRef Nothing
-        return val
+  return $ pullFromCache memoRef pull $ registerFini $ writeRef memoRef Nothing
 
 ----------------------------------------------------------------------
 -- common push-pull operations
@@ -448,38 +450,33 @@ const' x _ = x
 {-# NOINLINE const' #-}
 
 transparentMemoD
-  :: Priority
+  :: Initialize (Pull a, Notifier)
   -> Initialize (Pull a, Notifier)
-  -> Initialize (Pull a, Notifier)
-transparentMemoD prio orig = unsafeProtectFromDup (primMemoDiscrete prio) orig
+transparentMemoD orig = unsafeProtectFromDup primDiscreteMemo orig
 
 transparentMemoE
   :: Initialize (Pull [a], Notifier)
   -> Initialize (Pull [a], Notifier)
-transparentMemoE orig = unsafeProtectFromDup memo orig
-  where
-    memo (pull, notifier) = do
-      cachedPull <- primStepMemo pull
-      return (cachedPull, notifier)
+transparentMemoE orig = unsafeProtectFromDup primEventMemo orig
 
 transparentMemoS :: Initialize (Pull a) -> Initialize (Pull a)
 transparentMemoS orig = unsafeProtectFromDup primStepMemo orig
 
--- | Memoize a @Discrete@. The underlyng @Pull@ will be called at most once per
--- notification.
-primMemoDiscrete
-  :: Priority
-  -> (Pull a, Notifier)
-  -> Initialize (Pull a, Notifier)
-primMemoDiscrete prio (pull, notifier) =
-    debugFrame ("primMemo[prio=" ++ show prio ++ "]") $ do
-  debug $ "primMemo: new"
-  (pullpush, set, key)
-    <- newDiscreteInit $ error $ "primMemo: cache not initialized; prio=" ++ show prio
-  listenToPullPush key pull notifier prio $ \mode val -> do
-    debug $ "primMemo: writing to cache: prio=" ++ show prio
-    set mode val
-  return pullpush
+primDiscreteMemo :: (Pull a, Notifier) -> Initialize (Pull a, Notifier)
+primDiscreteMemo (pull, notifier) = do
+  ref <- newRef Nothing
+  listenToNotifier (WeakKey ref) notifier $
+    writeRef ref . Just =<< pull
+  return (pullFromCache ref pull (return ()), notifier)
+
+primEventMemo :: (Pull [a], Notifier) -> Initialize (Pull [a], Notifier)
+primEventMemo (pull, notifier) = do
+  ref <- newRef Nothing
+  listenToNotifier (WeakKey ref) notifier $
+    writeRef ref . Just =<< pull
+  return (pullFromCache ref pull (resetCache ref), notifier)
+  where
+    resetCache ref = registerFini $ writeRef ref (Just [])
 
 listenToPullPush
   :: WeakKey
@@ -732,12 +729,11 @@ discreteTrigger buf notify mode val = do
   whenPush mode notify
 
 mapDiscrete :: (a -> b) -> Discrete a -> Discrete b
-mapDiscrete f (Dis dprio dis) = Dis prio $ debugFrame "mapDiscrete" $ transparentMemoD memoprio $ do
+mapDiscrete f (Dis dprio dis) = Dis prio $ debugFrame "mapDiscrete" $ transparentMemoD $ do
   (pull, notifier) <- dis
   return (f <$> pull, notifier)
   where
-    prio = nextPrio memoprio
-    memoprio = nextPrio dprio
+    prio = nextPrio dprio
 
 pureDiscrete :: a -> Discrete a
 pureDiscrete value = Dis (bottomPrio bottomLocation) $
@@ -746,7 +742,7 @@ pureDiscrete value = Dis (bottomPrio bottomLocation) $
 apDiscrete :: Discrete (a -> b) -> Discrete a -> Discrete b
 -- both arguments must have been memoized
 apDiscrete (Dis fprio fun) (Dis aprio arg)
-    = Dis memoprio $ debugFrame "apDiscrete" $ transparentMemoD memoprio $ do
+    = Dis prio $ debugFrame "apDiscrete" $ transparentMemoD $ do
   dirtyRef <- newRef False
   isPullRef <- newRef False
   (pullpush, set, key) <- newDiscreteInit (error "apDiscrete: uninitialized")
@@ -772,7 +768,6 @@ apDiscrete (Dis fprio fun) (Dis aprio arg)
   where
     srcprio = max fprio aprio
     prio = nextPrio srcprio
-    memoprio = nextPrio prio
 
 listenToDiscrete
   :: WeakKey
