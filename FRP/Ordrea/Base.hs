@@ -1,4 +1,9 @@
-{-# LANGUAGE DeriveFunctor, GeneralizedNewtypeDeriving, ExistentialQuantification, DeriveDataTypeable #-}
+{-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE ExistentialQuantification #-}
+{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE PatternGuards #-}
+
 {-# OPTIONS_GHC -Wall #-}
 {-# OPTIONS_GHC -fno-warn-missing-signatures #-}
 module FRP.Ordrea.Base
