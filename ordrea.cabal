@@ -2,7 +2,7 @@
 -- documentation, see http://haskell.org/cabal/users-guide/
 
 name:                ordrea
-version:             0.0.0.0
+version:             0.1.0.0
 synopsis:            Push-based discrete-time FRP
 -- description:         
 license:             PublicDomain
@@ -17,4 +17,4 @@ cabal-version:       >=1.8
 library
   exposed-modules:     FRP.Ordrea
   other-modules:       FRP.Ordrea.Weak, FRP.Ordrea.Base     
-  build-depends:       base, transformers, containers, vector, HUnit >= 1.2
+  build-depends:       base >= 4.5, transformers >= 0.3, containers >= 0.4, vector >= 0.9, HUnit >= 1.2
