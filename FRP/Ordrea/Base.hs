@@ -3,6 +3,7 @@
 {-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE PatternGuards #-}
+{-# LANGUAGE BangPatterns #-}
 
 {-# OPTIONS_GHC -Wall #-}
 {-# OPTIONS_GHC -fno-warn-missing-signatures #-}
@@ -695,6 +696,27 @@ externalE ee = do
         occs <- liftIO $ swapMVar occsVar []
         trigger Push $ reverse occs
 
+takeWhileE :: (a -> Bool) -> Event a -> SignalGen (Event a)
+takeWhileE cond ~(Evt evtprio evt) = do
+  (push, trigger) <- liftIO $ newNotifier
+  ref <- newRef $ error "takeWhileE"
+  registerInit $ do
+    (evtPull, evtNot) <- evt
+    subref <- newRef evtPull
+    writeRef ref ([], Just subref)
+    listenToPullPush (WeakKey subref) evtPull evtNot prio $ \mode occs -> do
+      (_, eventRef) <- readRef ref
+      when (isJust eventRef) $ do
+        let !(occs', rest) = span cond occs
+        when (not $ null occs') $ do
+          modifyRef ref $ \(_, y) -> (occs', y)
+          whenPush mode trigger
+          registerFini $ modifyRef ref $ \(_, y) -> ([], y)
+        when (not $ null rest) $ registerFini $ writeRef ref ([], Nothing)
+  return $ Evt prio $ return (fst <$> readRef ref, push)
+  where
+    prio = nextPrio evtprio
+
 ----------------------------------------------------------------------
 -- discretes
 
@@ -1115,6 +1137,7 @@ _unitTest = runTestTT $ test
   , test_orderingViolation_joinDS
   , test_externalEvent
   , test_externalE
+  , test_takeWhileE
   ]
 
 test_signalFromList = do
@@ -1368,6 +1391,54 @@ test_externalE = do
   triggerExternalEvent ee "c"
   triggerExternalEvent ee "d"
   g >>= (@?=["c","d"])
+
+test_takeWhileE = do
+  finalizerRecord <- newRef []
+  inputRefA <- newRef []
+  inputRefB <- newRef []
+  let add ident = modifyRef finalizerRecord (ident:)
+  wA <- mkWeakWithIORef inputRefA inputRefA (Just $ add "A")
+  wB <- mkWeakWithIORef inputRefB inputRefB (Just $ add "B")
+  g <- start $ do
+    sigA <- externalS $ readRef inputRefA
+    sigB <- externalS $ readRef inputRefB
+    evtA <- takeWhileE (>0) $ signalToEvent sigA
+    evtB <- takeWhileE (>0) $ signalToEvent sigB
+    return $ (,) <$> eventToSignal evtA <*> eventToSignal evtB
+
+  performGC
+  readRef finalizerRecord >>= (@?=[])
+
+  writeToW wA [2, -1::Int]
+  writeToW wB [1, 2::Int]
+  g >>= (@?=([2], [1, 2]))
+  performGC
+  --readRef finalizerRecord >>= (@?=["A"])
+  --- ^ this line doesn't work as expected, for some reason
+
+  writeToW wA [3, 4]
+  writeToW wB []
+  g >>= (@?=([], []))
+  performGC
+  readRef finalizerRecord >>= (@?=["A"])
+
+  writeToW wA [5, 6]
+  writeToW wB [3]
+  g >>= (@?=([], [3]))
+  performGC
+  readRef finalizerRecord >>= (@?=["A"])
+
+  writeToW wA [7, 8]
+  writeToW wB [-2]
+  g >>= (@?=([], []))
+  performGC
+  readRef finalizerRecord >>= (@?=["B", "A"])
+  where
+    writeToW wRef val = do
+      m'ref <- deRefWeak wRef
+      case m'ref of
+        Nothing -> return ()
+        Just ref -> writeRef ref val
 
 shouldThrowOrderingViolation :: IO a -> Assertion
 shouldThrowOrderingViolation x = do
