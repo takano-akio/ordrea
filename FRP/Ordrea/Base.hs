@@ -26,7 +26,7 @@ module FRP.Ordrea.Base
   , start, externalS, joinS, delayS, signalFromList, networkToList
   , networkToListGC
 
-  , accumD, changesD, preservesD, delayD
+  , accumD, preservesD, delayD
 
   , eventToSignal, signalToEvent, applySE
 
@@ -111,16 +111,6 @@ data Discrete a = Dis !Priority !(Initialize (Pull a, Notifier))
   -- The Notifier is active iff the value might have changed.
 
 type Consumer a = a -> IO ()
-
-----------------------------------------------------------------------
--- callback modes
-
-data CallbackMode = Pull | Push
-  deriving (Eq, Show)
-
-whenPush :: CallbackMode -> Run () -> Run ()
-whenPush Push x = x
-whenPush Pull _ = return ()
 
 ----------------------------------------------------------------------
 -- locations and priorities
@@ -224,8 +214,9 @@ deRefWeakLike (WeakLike a) = a
 
 data GEnv = GEnv
   { envRegisterInit :: Consumer (Initialize ())
-  , envRegisterPrep :: Consumer (Run ())
+  , envGRegisterPrep :: Consumer (Run ())
   , envGenLocation :: IO Location
+  , envGCurrentStep :: Maybe REnv
   }
 
 -- Note [Global preparation accumulator]
@@ -238,35 +229,35 @@ data GEnv = GEnv
 --
 -- Actions can be added anytime anywhere, even in different threads.
 
--- | Run SignalGen in IO. Returns a pair of the result and an action
--- to be performed in the first execution step for the new network.
+-- | Run SignalGen in IO.
 runSignalGen
   :: Consumer (Run ()) -- ^ see Note [Global preparation accumulator]
   -> Location -- ^ the location of the parent node of this subnetwork
   -> Notifier -- ^ the global clock notifier
+  -> Maybe REnv -- ^ the Run env if we are in an execution step
   -> SignalGen a -- ^ an action to create a (sub)network
-  -> IO (a, Run ())
-runSignalGen regPrep parentLoc clock (SignalGen gen) = do
+  -> IO a
+runSignalGen regPrep parentLoc clock curStep (SignalGen gen) = do
   (registerI, runAccumI) <- newActionAccum
   locGen <- newLocationGen parentLoc
   let
     genv = GEnv
       { envRegisterInit = registerI
-      , envRegisterPrep = regPrep
+      , envGRegisterPrep = regPrep
       , envGenLocation = locGen
+      , envGCurrentStep = curStep
       }
   result <- runReaderT gen genv
-  (_, runAccumF) <- runInit parentLoc clock runAccumI
-  return (result, runAccumF)
+  runInit parentLoc clock curStep regPrep runAccumI
+  return result
 
 -- | Run SignalGen in the Run monad, as part of an execution step.
 runSignalGenInStep :: SignalGen (Location -> Notifier -> SignalGen a -> Run a)
 runSignalGenInStep = do
   regPrep <- getPreparationAdder
   return $ \parentLoc clock sgen -> debugFrame "SGenInStep" $ do
-    (result, initial) <- liftIO $ runSignalGen regPrep parentLoc clock sgen
-    isolatingUpdates initial
-    return result
+    renv <- ask
+    liftIO $ runSignalGen regPrep parentLoc clock (Just renv) sgen
 
 -- | Run a SignalGen action that constructs an independent network.
 -- Returns a pair of the result and an "preparation" action to be performed
@@ -274,18 +265,17 @@ runSignalGenInStep = do
 runSignalGenToplevel :: SignalGen (Initialize a) -> IO (a, Run ())
 runSignalGenToplevel gen = do
   (clock, clockTrigger) <- newNotifier
-  prepVar <- newEmptyMVar
-  (val, initial) <- debugFrame "toplevel" $ do
+  prepVar <- newMVar (prepClock clockTrigger)
+  val <- debugFrame "toplevel" $ do
     ref <- newRef undefined
-    ((), initial) <- runSignalGen (addToPrep prepVar) bottomLocation clock $ do
+    runSignalGen (addToPrep prepVar) bottomLocation clock Nothing $ do
       i <- gen
       registerInit $ writeRef ref =<< i
-    val <- readRef ref
-    return (val, initial)
-  liftIO $ putMVar prepVar initial
-  return (val, join $ liftIO $ swapMVar prepVar clockTrigger)
+    readRef ref
+  return (val, join $ liftIO $ swapMVar prepVar (prepClock clockTrigger))
   where
     addToPrep prepVar x = modifyMVar_ prepVar (\r -> return (x >> r))
+    prepClock clockTrigger = registerUpd (bottomPrio bottomLocation) clockTrigger
 
 -- | Generate a new location.
 genLocation :: SignalGen Location
@@ -304,7 +294,7 @@ registerInit ini = SignalGen $ do
 -- | Get access to the global preparation accumulator. See Note [Global
 -- preparation accumulator].
 getPreparationAdder :: SignalGen (Run () -> IO ())
-getPreparationAdder = SignalGen $ asks envRegisterPrep
+getPreparationAdder = SignalGen $ asks envGRegisterPrep
 
 ----------------------------------------------------------------------
 -- Initialize monad
@@ -312,17 +302,9 @@ getPreparationAdder = SignalGen $ asks envRegisterPrep
 data IEnv = IEnv
   { envClock :: Notifier
   , envParentLocation :: Location
-  , envRegisterFirstStep :: Consumer (Run ())
+  , envIRegisterPrep :: Consumer (Run ())
+  , envICurrentStep :: Maybe REnv
   }
-
--- | Register an action to be run in the first step for this network.
--- If this is a subnetwork, it will be run immediately after the
--- initialization phase.
-registerFirstStep :: Run () -> Initialize ()
-registerFirstStep action = do
-  reg <- asks envRegisterFirstStep
-  frm <- debugGetFrame
-  lift $ reg $ debugPutFrame "fst" frm action
 
 -- | Get the global clock.
 getClock :: Initialize Notifier
@@ -331,29 +313,48 @@ getClock = asks envClock
 _getParentLocation :: Initialize Location
 _getParentLocation = asks envParentLocation
 
--- | Run Initialize. Returns a pair of the result and an action to
--- be performed in the first execution step for the new network.
-runInit :: Location -> Notifier -> Initialize a -> IO (a, Run ())
-runInit parentLoc clock i = do
-  (registerF, runAccumF) <- newActionAccum
+-- | Run Initialize
+runInit :: Location -> Notifier -> Maybe REnv -> Consumer (Run ()) -> Initialize a -> IO a
+runInit parentLoc clock curStep regPrep i = do
   let
     ienv = IEnv
       { envClock = clock
-      , envRegisterFirstStep = registerF
+      , envIRegisterPrep = regPrep
       , envParentLocation = parentLoc
+      , envICurrentStep = curStep
       }
-  result <- runReaderT i ienv
-  return (result, runAccumF)
+  runReaderT i ienv
 
 -- | Creates a function that runs an @Initialize@ action inside @Run@,
 -- using @loc@ as the parent location.
 makeSubinitializer :: Location -> Initialize (Initialize a -> Run a)
 makeSubinitializer loc = do
   clock <- getClock
+  regPrep <- asks envIRegisterPrep
   return $ \sub -> do
-    (result, first) <- liftIO $ runInit loc clock sub
-    isolatingUpdates $ debugFrame "makeSubInit.first" first
-    return result
+    renv <- ask
+    liftIO $ runInit loc clock (Just renv) regPrep sub
+
+runInCurrentStep
+  :: Initialize a -- ^ action to perform if we're not inside a step
+  -> Run a -- ^ action to perform if we are inside a step
+  -> Initialize a
+runInCurrentStep no yes = do
+  curStep <- asks envICurrentStep
+  case curStep of
+    Nothing -> no
+    Just renv -> liftIO $ runReaderT yes renv
+
+runInStep :: Run () -> Initialize ()
+runInStep action = runInCurrentStep (registerNextStep action) action
+
+registerNextStep :: Run () -> Initialize ()
+registerNextStep x = do
+  addPrep <- asks envIRegisterPrep
+  liftIO $ addPrep x
+
+getPreparationAdderI :: Initialize (Run () -> IO ())
+getPreparationAdderI = asks envIRegisterPrep
 
 ----------------------------------------------------------------------
 -- Run monad
@@ -404,22 +405,6 @@ registerUpd prio upd = do
   pqueueRef <- asks envPendingUpdates
   modifyRef pqueueRef $ M.insertWith' (>>) prio upd
 
--- | @isolatingUpdates action@ runs @action@, and immediately executes
--- those actions registered with 'registerUpd' inside @action@.
--- TODO: remove it, this is a hack.
-isolatingUpdates :: Run a -> Run a
-isolatingUpdates action = do
-  pqueueRef <- asks envPendingUpdates
-  pqueue <- readRef pqueueRef
-  writeRef pqueueRef M.empty
-  debug "isolating updates"
-  result <- action
-  debug "running isolated updates"
-  runUpdates
-  debug "done running isolated updates"
-  writeRef pqueueRef pqueue
-  return result
-
 ----------------------------------------------------------------------
 -- push
 
@@ -436,7 +421,7 @@ type Notifier = NotifierG Run
 
 -- | Register a callback to be called when the notifier is triggered.
 -- It will be unregistered when the given WeakKey is invalidated.
-listenToNotifier :: WeakKey -> Notifier -> Run () -> Initialize ()
+listenToNotifier :: (MonadIO m) => WeakKey -> Notifier -> Run () -> m ()
 listenToNotifier key push handler = do
   frm <- debugGetFrame
   weak <- liftIO $ mkWeakWithKey key (debugPutFrame "notifier" frm handler)
@@ -589,13 +574,14 @@ listenToPullPush
   -> Pull a
   -> Notifier
   -> Priority
-  -> (CallbackMode -> a -> Run ())
+  -> (a -> Run ())
   -> Initialize ()
 listenToPullPush key pull notifier prio handler = do
-  registerFirstStep $ registerUpd prio $ handler Pull =<< pull
-    --- ^ use pull for the first step
-  listenToNotifier key notifier $ handler Push =<< pull
-    --- ^ use push for the subsequent steps
+  addPrep <- getPreparationAdderI
+  runInStep $ registerUpd prio $ do
+    handler =<< pull
+    liftIO $ addPrep $
+      listenToNotifier key notifier $ handler =<< pull
 
 ----------------------------------------------------------------------
 -- external events
@@ -641,22 +627,22 @@ listenToEvent
   :: WeakKey
   -> Event a
   -> Priority
-  -> (CallbackMode -> [a] -> Run ())
+  -> ([a] -> Run ())
   -> Initialize ()
 listenToEvent key (Evt evtprio evt) prio handler = debugFrame "listenToEvent" $ do
   prio `shouldBeGreaterThan` evtprio
   (evtPull, evtNot) <- evt
-  listenToPullPush key evtPull evtNot prio $ \mode occs ->
-    when (not $ null occs) $ handler mode occs
+  listenToPullPush key evtPull evtNot prio $ \occs ->
+    when (not $ null occs) $ handler occs
 
-newEventSG :: Priority -> SignalGen (Event a, CallbackMode -> [a] -> Run (), WeakKey)
+newEventSG :: Priority -> SignalGen (Event a, [a] -> Run (), WeakKey)
 newEventSG prio = do
   ref <- newRef []
   (push, trigger) <- liftIO newNotifier
   let evt = Evt prio $ return (eventPull ref, push)
   return (evt, eventTrigger ref trigger, WeakKey ref)
 
-newEventInit :: Initialize ((Pull [a], Notifier), CallbackMode -> [a] -> Run (), WeakKey)
+newEventInit :: Initialize ((Pull [a], Notifier), [a] -> Run (), WeakKey)
 newEventInit = do
   ref <- newRef []
   (push, trigger) <- liftIO newNotifier
@@ -665,24 +651,24 @@ newEventInit = do
 eventPull :: IORef [a] -> Pull [a]
 eventPull buf = readRef buf
 
-eventTrigger :: IORef [a] -> Run () -> CallbackMode -> [a] -> Run ()
-eventTrigger buf notify mode occs = do
+eventTrigger :: IORef [a] -> Run () -> [a] -> Run ()
+eventTrigger buf notify occs = do
   writeRef buf occs
   registerFini $ do
     debug "clearing event ref"
     writeRef buf []
-  whenPush mode notify
+  notify
 
 transformEvent :: ([a] -> [b]) -> Event a -> Event b
 transformEvent f parent@(Evt evprio _) = Evt prio $ debugFrame "transformEvent" $ unsafeCache $ do
   (pullpush, trigger, key) <- newEventInit
-  listenToEvent key parent prio $ \mode xs -> case f xs of
+  listenToEvent key parent prio $ \xs -> case f xs of
     [] -> do
       debug $ "transformEvent: prio=" ++ show prio ++ " -> []"
       return ()
     ys -> do
       debug $ "transformEvent: prio=" ++ show prio ++ " -> len:" ++ show (length ys)
-      trigger mode ys
+      trigger ys
   return pullpush
   where
     prio = nextPrio evprio
@@ -702,8 +688,8 @@ generatorE evt = do
   runSG <- runSignalGenInStep
   registerInit $ do
     clock <- getClock
-    listenToEvent key evt prio $ \mode gens ->
-      trigger mode =<< mapM (runSG here clock) gens
+    listenToEvent key evt prio $ \gens ->
+      trigger =<< mapM (runSG here clock) gens
   return result
 
 mergeEvents :: [Event a] -> Event a
@@ -712,17 +698,17 @@ mergeEvents evts = Evt prio $ unsafeCache $ do
   (pullpush, trigger, key) <- newEventInit
   occListRef <- newRef []
   let
-    upd mode = do
+    upd = do
       occList <- readRef occListRef
       debug $ "mergeEvents: upd: prio=" ++ show prio ++ "; total occs=" ++ show (length $ concatMap snd occList)
       when (not $ null occList) $ do
         writeRef occListRef []
-        trigger mode $ concatMap snd $ sortBy (comparing fst) occList
+        trigger $ concatMap snd $ sortBy (comparing fst) occList
   forM_ (zip [0::Int ..] evts) $ \(num, evt) ->
-    listenToEvent key evt prio $ \mode occs -> do
+    listenToEvent key evt prio $ \occs -> do
       debug $ "mergeEvents: listen: noccs=" ++ show (length occs)
       modifyRef occListRef ((num, occs):)
-      registerUpd prio $ upd mode
+      registerUpd prio upd
   return pullpush
   where
     prio = nextPrio $ maximum $ map evtPrio evts
@@ -743,13 +729,12 @@ dropStepE :: Event a -> SignalGen (Event a)
 dropStepE ~(Evt evtprio evt) = do
   (result, trigger, key) <- newEventSG prio
 
-  -- here we manually do the latter half of listenToPullPush
+  addPrep <- getPreparationAdder
   registerInit $ do
     (getoccs, evtnotifier) <- evt
-    listenToNotifier key evtnotifier $ do
+    runInStep $ liftIO $ addPrep $ listenToNotifier key evtnotifier $ do
       occs <- getoccs
-      when (not $ null occs) $ trigger Push occs
-
+      when (not $ null occs) $ trigger occs
   return result
   where
     prio = nextPrio evtprio
@@ -761,12 +746,12 @@ scanE :: a -> Event (a -> a) -> SignalGen (Event a)
 scanE initial evt@(~(Evt evtprio _)) = do
   (myevt, trigger, key) <- newEventSG prio
   ref <- newRef initial
-  registerInit $ listenToEvent key evt prio $ \mode occs -> do
+  registerInit $ listenToEvent key evt prio $ \occs -> do
     debug $ "accumE: occs=" ++ show (length occs)
     oldVal <- readRef ref
     let _:vals = scanl (flip ($)) oldVal occs
     writeRef ref $ last vals
-    trigger mode vals
+    trigger vals
   return myevt
   where
     prio = nextPrio evtprio
@@ -775,12 +760,12 @@ mapAccumE :: s -> Event (s -> (s, a)) -> SignalGen (Event a)
 mapAccumE initial evt@(~(Evt evtprio _)) = do
   (myevt, trigger, key) <- newEventSG prio
   ref <- newRef initial
-  registerInit $ listenToEvent key evt prio $ \mode occs -> do
+  registerInit $ listenToEvent key evt prio $ \occs -> do
     debug $ "mapAccumE: occs=" ++ show (length occs)
     oldVal <- readRef ref
     let (newVal, occs') = mapAccumL (flip ($)) oldVal occs
     writeRef ref $ newVal
-    trigger mode occs'
+    trigger occs'
   return myevt
   where
     prio = nextPrio evtprio
@@ -826,7 +811,7 @@ expandE = transformEvent1 (:[])
 externalE :: ExternalEvent a -> SignalGen (Event a)
 externalE ee = do
   occsVar <- liftIO $ newMVar []
-  (evt, trigger, key) <- newEventSG (bottomPrio bottomLocation)
+  (evt, trigger, key) <- newEventSG prio
   addToPrep <- getPreparationAdder
   handler <- liftIO $ fmap weakToLike $
     mkWeakWithKey key $ add trigger addToPrep occsVar
@@ -835,9 +820,11 @@ externalE ee = do
   where
     add trigger addToPrep occsVar occ = do
       firstTime <- modifyMVar occsVar $ \occs -> return (occ:occs, null occs)
-      when firstTime $ addToPrep $ do
+      when firstTime $ addToPrep $ registerUpd prio $ do
         occs <- liftIO $ swapMVar occsVar []
-        trigger Push $ reverse occs
+        trigger $ reverse occs
+
+    prio = bottomPrio bottomLocation
 
 takeWhileE :: (a -> Bool) -> Event a -> SignalGen (Event a)
 takeWhileE cond ~(Evt evtprio evt) = do
@@ -847,13 +834,13 @@ takeWhileE cond ~(Evt evtprio evt) = do
     (evtPull, evtNot) <- evt
     subref <- newRef evtPull
     writeRef ref ([], Just subref)
-    listenToPullPush (WeakKey subref) evtPull evtNot prio $ \mode occs -> do
+    listenToPullPush (WeakKey subref) evtPull evtNot prio $ \occs -> do
       (_, eventRef) <- readRef ref
       when (isJust eventRef) $ do
         let !(occs', rest) = span cond occs
         when (not $ null occs') $ do
           modifyRef ref $ \(_, y) -> (occs', y)
-          whenPush mode trigger
+          trigger
           registerFini $ modifyRef ref $ \(_, y) -> ([], y)
         when (not $ null rest) $ registerFini $ writeRef ref ([], Nothing)
   return $ Evt prio $ return (fst <$> readRef ref, push)
@@ -872,7 +859,7 @@ instance Applicative Discrete where
 
 newDiscreteInit
   :: a
-  -> Initialize ((Pull a, Notifier), CallbackMode -> a -> Run (), WeakKey)
+  -> Initialize ((Pull a, Notifier), a -> Run (), WeakKey)
 newDiscreteInit initial = do
   ref <- newRef initial
   (push, trigger) <- liftIO newNotifier
@@ -881,17 +868,17 @@ newDiscreteInit initial = do
 newDiscreteSG
   :: a
   -> Priority
-  -> SignalGen (Discrete a, Run a, CallbackMode -> a -> Run (), WeakKey)
+  -> SignalGen (Discrete a, Run a, a -> Run (), WeakKey)
 newDiscreteSG initial prio = do
   ref <- newRef initial
   (push, trigger) <- liftIO newNotifier
   let dis = Dis prio $ return (readRef ref, push)
   return (dis, readRef ref, discreteTrigger ref trigger, WeakKey ref)
 
-discreteTrigger :: IORef a -> Run () -> CallbackMode -> a -> Run ()
-discreteTrigger buf notify mode val = do
+discreteTrigger :: IORef a -> Run () -> a -> Run ()
+discreteTrigger buf notify val = do
   writeRef buf val
-  whenPush mode notify
+  notify
 
 mapDiscrete :: (a -> b) -> Discrete a -> Discrete b
 mapDiscrete f (Dis dprio dis) = Dis prio $ debugFrame "mapDiscrete" $ transparentMemoD $ do
@@ -909,7 +896,6 @@ apDiscrete :: Discrete (a -> b) -> Discrete a -> Discrete b
 apDiscrete (Dis fprio fun) (Dis aprio arg)
     = Dis prio $ debugFrame "apDiscrete" $ unsafeCache $ do
   dirtyRef <- newRef False
-  isPullRef <- newRef False
   (pullpush, set, key) <- newDiscreteInit (error "apDiscrete: uninitialized")
   (funPull, funNot) <- fun
   (argPull, argNot) <- arg
@@ -918,14 +904,11 @@ apDiscrete (Dis fprio fun) (Dis aprio arg)
       debug $ "apDiscrete.upd; prio=" ++ show prio
       dirty <- readRef dirtyRef
       when dirty $ do
-        isPull <- readRef isPullRef
         writeRef dirtyRef False
-        writeRef isPullRef False
-        set (if isPull then Pull else Push) =<< funPull <*> argPull
-  let handler mode _ = do
+        set =<< funPull <*> argPull
+  let handler _ = do
         debug $ "apDiscrete.handler: prio=" ++ show prio
         writeRef dirtyRef True
-        modifyRef isPullRef (|| mode==Pull)
         registerUpd prio upd
   listenToPullPush key funPull funNot prio handler
   listenToPullPush key argPull argNot prio handler
@@ -938,7 +921,7 @@ listenToDiscrete
   :: WeakKey
   -> Discrete a
   -> Priority
-  -> (CallbackMode -> a -> Run ())
+  -> (a -> Run ())
   -> Initialize ()
 listenToDiscrete key (Dis disprio dis) prio handler = do
   prio `shouldBeGreaterThan` disprio
@@ -954,19 +937,17 @@ joinDD outer@ ~(Dis outerprio _) = do
   registerInit $ do
     prio `shouldBeGreaterThan` outerprio
     runSubinit <- makeSubinitializer here
-    listenToDiscrete (WeakKey outerRef) outer prio $ \outerMode inner -> do
-      debug $ "joinDD: outer; mode=" ++ show outerMode
+    listenToDiscrete (WeakKey outerRef) outer prio $ \inner -> do
+      debug $ "joinDD: outer"
       innerRef <- newRef $ error "joinDD: innerRef not initialized"
       writeRef outerRef innerRef
       runSubinit $ do
-        listenToDiscrete (WeakKey innerRef) inner prio $ \innerMode val -> do
+        listenToDiscrete (WeakKey innerRef) inner prio $ \val -> do
           currentInnerRef <- readRef outerRef
           when (currentInnerRef == innerRef) $ do
-            debug $ "joinDD: inner; mode=" ++ show innerMode
+            debug $ "joinDD: inner"
             writeRef innerRef val
-            case (outerMode, innerMode) of
-              (Pull, Pull) -> return ()
-              _ -> trigger
+            trigger
   return $ Dis prio $ return (readRef outerRef >>= readRef, push)
 
 joinDE :: Discrete (Event a) -> SignalGen (Event a)
@@ -978,21 +959,18 @@ joinDE outer@ ~(Dis outerprio _) = do
   registerInit $ do
     prio `shouldBeGreaterThan` outerprio
     runSubinit <- makeSubinitializer here
-    listenToDiscrete (WeakKey outerRef) outer prio $ \outerMode inner -> do
-      debug $ "joinDE: outer; mode=" ++ show outerMode
+    listenToDiscrete (WeakKey outerRef) outer prio $ \inner -> do
+      debug $ "joinDE: outer"
       innerRef <- newRef []
       writeRef outerRef innerRef
       runSubinit $ do
-        listenToEvent (WeakKey innerRef) inner prio $ \innerMode occs -> do
+        listenToEvent (WeakKey innerRef) inner prio $ \occs -> do
           currentInnerRef <- readRef outerRef
           when (currentInnerRef == innerRef) $ do
-            debug $ "joinDE: inner; mode=" ++ show innerMode
-              ++ "; noccs=" ++ show (length occs)
+            debug $ "joinDE: inner noccs=" ++ show (length occs)
             writeRef innerRef occs
             registerFini $ writeRef innerRef []
-            case (outerMode, innerMode) of
-              (Pull, Pull) -> return ()
-              _ -> trigger
+            trigger
   return $ Evt prio $ return (readRef outerRef >>= readRef, push)
 
 joinDS :: Discrete (Signal a) -> SignalGen (Signal a)
@@ -1004,7 +982,7 @@ joinDS outer@ ~(Dis outerprio _) = do
     prio `shouldBeGreaterThan` outerprio
     runSubinit <- makeSubinitializer here
     listenToDiscrete (WeakKey outerRef) outer prio
-        $ \_ (Sig innerprio sig) -> do
+        $ \(Sig innerprio sig) -> do
       debug $ "joinDS: outer"
       pull <- runSubinit $ do
         prio `shouldBeGreaterThan` innerprio
@@ -1033,7 +1011,8 @@ start gensig = do
     return $ sig
   return $ runRun $ debugFrame "step" $ do
     debug "step"
-    isolatingUpdates $ prep
+    prep
+    runUpdates
     debugFrame "getval" getval
 
 externalS :: IO a -> SignalGen (Signal a)
@@ -1061,7 +1040,7 @@ delayS initial ~(Sig _sigprio sig) = do
   registerInit $ do
     clock <- getClock
     pull <- sig
-    listenToNotifier (WeakKey ref) clock $ do
+    registerNextStep $ listenToNotifier (WeakKey ref) clock $ do
       newVal <- pull
       registerFini $ writeRef ref newVal
   return $ Sig prio $ return $ readRef ref
@@ -1094,27 +1073,18 @@ accumD :: a -> Event (a -> a) -> SignalGen (Discrete a)
 accumD initial evt@(~(Evt evtprio _)) = do
   debug $ "accumD: creating; prio=" ++ show prio
   (dis, get, set, key) <- newDiscreteSG initial prio
-  registerInit $ listenToEvent key evt prio $ \mode occs -> do
+  registerInit $ listenToEvent key evt prio $ \occs -> do
     debug $ "accumD: prio=" ++ show prio ++ "; occs=" ++ show (length occs)
     oldVal <- get
-    set mode $! foldl' (flip ($)) oldVal occs
+    set $! foldl' (flip ($)) oldVal occs
   return dis
   where
     prio = nextPrio evtprio
 
-changesD :: Discrete a -> Event a
-changesD (Dis disprio dis) = Evt prio $ unsafeCache $ do
-  (pullpush, trigger, key) <- newEventInit
-  (dispull, notifier) <- dis
-  listenToNotifier key notifier $ trigger Push . (:[]) =<< dispull
-  return pullpush
-  where
-    prio = nextPrio disprio
-
 preservesD :: Discrete a -> SignalGen (Event a)
 preservesD dis@ ~(Dis disprio _) = do
   (evt, trigger, key) <- newEventSG prio
-  registerInit $ listenToDiscrete key dis prio $ \mode val -> trigger mode [val]
+  registerInit $ listenToDiscrete key dis prio $ \val -> trigger [val]
   return evt
   where
     prio = nextPrio disprio
@@ -1124,8 +1094,8 @@ delayD initial dis@ ~(Dis disprio _dis) = do
   (dis2, _get, set, key) <- newDiscreteSG initial (bottomPrio bottomLocation)
   registerInit $ do
     clock <- getClock
-    listenToDiscrete key dis (nextPrio disprio) $ \_mode val ->
-      listenToNotifierOnce clock $ set Push val
+    listenToDiscrete key dis (nextPrio disprio) $ \val ->
+      listenToNotifierOnce clock $ set val
   return dis2
 
 ----------------------------------------------------------------------
@@ -1146,16 +1116,15 @@ signalToEvent (Sig sigprio sig) = Evt prio $ unsafeCache $ do
     -- to keep the new notifier alive as long as the new pull, rather
     -- than the original pull, is alive.
   clock <- getClock
-  registerFirstStep $ registerUpd prio $ onclock sigpull (trigger Pull)
-  listenToNotifier key clock $ registerUpd prio $ onclock sigpull (trigger Push)
-  return pullpush
-  where
-    prio = nextPrio sigprio
-    onclock sigpull trigger = do
+  listenToPullPush key (return ()) clock prio $ \_ ->
+    registerUpd prio $ do
       occs <- sigpull
       debug $ "signalToEvent: onclock prio=" ++ show prio
         ++ "; noccs=" ++ show (length occs)
       when (not $ null occs) $ trigger occs
+  return pullpush
+  where
+    prio = nextPrio sigprio
 
 applySE :: Signal (a -> b) -> Event a -> Event  b
 applySE (Sig fprio fun) arg@(Evt aprio _)
@@ -1163,13 +1132,13 @@ applySE (Sig fprio fun) arg@(Evt aprio _)
   (pullpush, trigger, key) <- newEventInit
   funPull <- fun
   let
-    upd mode occs = do
+    upd occs = do
       debug $ "applySE; prio=" ++ show prio
       funVal <- funPull
-      trigger mode $ map funVal occs
-  listenToEvent key arg prio $ \mode occs -> do
+      trigger $ map funVal occs
+  listenToEvent key arg prio $ \occs -> do
     debug $ "applySE: prio=" ++ show prio
-    registerUpd prio $ upd mode occs
+    registerUpd prio $ upd occs
   return pullpush
   where
     srcprio = max fprio aprio
@@ -1266,13 +1235,14 @@ debugTraceEnabled = False
 _unitTest :: IO Counts
 _unitTest = runTestTT $ test
   [ test_signalFromList
+  , test_signalToEvent
   , test_accumD
-  , test_changesD
   , test_delayD
   , test_mappendEvent
   , test_fmapEvent
   , test_filterE
   , test_dropStepE
+  , test_dropStepE1
   , test_apDiscrete
   , test_apDiscrete1
   , test_eventFromList
@@ -1297,8 +1267,14 @@ _unitTest = runTestTT $ test
   ]
 
 test_signalFromList = do
-  r <- networkToList 4 $ signalFromList ["foo", "bar", "baz", "quux"]
+  r <- networkToList 4 $ signalFromList ["foo", "bar", "baz", "quux", "xyzzy"]
   r @?= ["foo", "bar", "baz", "quux"]
+
+test_signalToEvent = do
+  r <- networkToList 3 $ do
+    s0 <- signalFromList ["foo", "", "baz"]
+    return $ eventToSignal $ signalToEvent s0
+  r @?= ["foo", "", "baz"]
 
 test_accumD = do
   r <- networkToList 3 $ do
@@ -1306,15 +1282,6 @@ test_accumD = do
     accD <- accumD "<>" $ append <$> signalToEvent strS
     return $ discreteToSignal accD
   r @?= ["<>/'f'/'o'/'o'", "<>/'f'/'o'/'o'", "<>/'f'/'o'/'o'/'b'/'a'/'z'"]
-  where
-    append ch str = str ++ "/" ++ show ch
-
-test_changesD = do
-  r <- networkToList 3 $ do
-    strS <- signalFromList ["foo", "", "baz"]
-    accD <- accumD "<>" $ append <$> signalToEvent strS
-    return $ eventToSignal $ changesD accD
-  r @?= [[], [], ["<>/'f'/'o'/'o'/'b'/'a'/'z'"]]
   where
     append ch str = str ++ "/" ++ show ch
 
@@ -1331,9 +1298,10 @@ test_mappendEvent = do
   r <- networkToListGC 3 $ do
     strS <- signalFromList ["foo", "", "baz"]
     accD <- accumD "<>" $ append <$> signalToEvent strS
+    ch <- preservesD accD
     return $ eventToSignal $
-      changesD accD `mappend` (signalToEvent $ (:[]) <$> strS)
-  r @?= [["foo"], [""], ["<>/'f'/'o'/'o'/'b'/'a'/'z'", "baz"]]
+      ch `mappend` (signalToEvent $ (:[]) <$> strS)
+  r @?= [["<>/'f'/'o'/'o'", "foo"], [""], ["<>/'f'/'o'/'o'/'b'/'a'/'z'", "baz"]]
   where
     append ch str = str ++ "/" ++ show ch
 
@@ -1366,6 +1334,11 @@ test_dropStepE = do
     return $ eventToSignal $ lenE `mappend` lenE
   r @?= ["", "", "bazbaz"]
 
+test_dropStepE1 = do
+  r <- networkToListGC 3 $
+    eventToSignal <$> dropStepE stepClockE
+  r @?= [[], [()], [()]]
+
 test_apDiscrete = do
   r <- networkToListGC 4 $ do
     ev0 <- signalToEvent <$> signalFromList [[], [], [1::Int], [2,3]]
@@ -1373,8 +1346,8 @@ test_apDiscrete = do
     dis0 <- accumD 0 $ max <$> ev0
     dis1 <- accumD 0 $ max <$> ev1
     let dis = (*) <$> dis0 <*> dis1
-    return $ eventToSignal $ changesD dis
-  r @?= [[], [0], [4], [15]]
+    eventToSignal <$> preservesD dis
+  r @?= [[0], [0], [4], [15]]
 
 test_apDiscrete1 = do
   r <- networkToListGC 4 $ do
