@@ -7,7 +7,7 @@ synopsis:            Push-based discrete-time FRP
 -- description:         
 license:             PublicDomain
 license-file:        LICENSE
-author:              Takano Akio
+author:              Takano Akio, Andrew Richards
 maintainer:          Takano Akio <aljee@hyper.cx>
 -- copyright:           
 category:            FRP
