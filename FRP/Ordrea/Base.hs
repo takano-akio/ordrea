@@ -14,7 +14,9 @@ module FRP.Ordrea.Base
   , ExternalEvent
   , newExternalEvent, triggerExternalEvent, listenToExternalEvent
 
-  , generatorE, filterE, stepClockE, dropStepE, eventFromList, accumE
+  , generatorE, filterE, stepClockE, dropStepE, eventFromList
+  , scanE, mapAccumE
+  , accumE, scanAccumE
   , mapMaybeE, justE, flattenE, expandE, externalE
 
   , joinDD, joinDE, joinDS
@@ -652,8 +654,8 @@ dropStepE ~(Evt evtprio evt) = do
 eventFromList :: [[a]] -> SignalGen (Event a)
 eventFromList occs = signalToEvent <$> signalFromList (occs ++ repeat [])
 
-accumE :: a -> Event (a -> a) -> SignalGen (Event a)
-accumE initial evt@(~(Evt evtprio _)) = do
+scanE :: a -> Event (a -> a) -> SignalGen (Event a)
+scanE initial evt@(~(Evt evtprio _)) = do
   (myevt, trigger, key) <- newEventSG prio
   ref <- newRef initial
   registerInit $ listenToEvent key evt prio $ \mode occs -> do
@@ -665,6 +667,28 @@ accumE initial evt@(~(Evt evtprio _)) = do
   return myevt
   where
     prio = nextPrio evtprio
+
+mapAccumE :: s -> Event (s -> (s, a)) -> SignalGen (Event a)
+mapAccumE initial evt@(~(Evt evtprio _)) = do
+  (myevt, trigger, key) <- newEventSG prio
+  ref <- newRef initial
+  registerInit $ listenToEvent key evt prio $ \mode occs -> do
+    debug $ "mapAccumE: occs=" ++ show (length occs)
+    oldVal <- readRef ref
+    let (newVal, occs') = mapAccumL (flip ($)) oldVal occs
+    writeRef ref $ newVal
+    trigger mode occs'
+  return myevt
+  where
+    prio = nextPrio evtprio
+
+{-# DEPRECATED accumE "accumE has been renamed to scanE" #-}
+accumE :: a -> Event (a -> a) -> SignalGen (Event a)
+accumE = scanE
+
+{-# DEPRECATED scanAccumE "scanAccumE has been renamed to mapAccumE" #-}
+scanAccumE :: s -> Event (s -> (s, a)) -> SignalGen (Event a)
+scanAccumE = mapAccumE
 
 mapMaybeE :: (a -> Maybe b) -> Event a -> Event b
 mapMaybeE f = transformEvent (mapMaybe f)
