@@ -1200,7 +1200,9 @@ _unitTest = runTestTT $ test
   , test_externalEvent
   , test_externalE
   , test_takeWhileE
+  , test_mapAccumE
   , test_mapAccumEM
+  , test_mapAccumEquivalent
   ]
 
 test_signalFromList = do
@@ -1512,6 +1514,14 @@ test_takeWhileE = do
         Nothing -> return ()
         Just ref -> writeRef ref val
 
+mkAccumCount n ac f = networkToList n $ do
+  evt <- eventFromList $ map pure $ repeat 1
+  eventToSignal <$> ac 0 ((\i s -> f (i + s, i + s :: Int)) <$> evt)
+
+test_mapAccumE = do
+  r <- mkAccumCount 10 mapAccumE id
+  r @?= (take 10 $ map pure (iterate (+1) 1))
+
 test_mapAccumEM = do
   r <- networkToList 16 $ do
     evt <- eventFromList $ map pure $ iterate (+1) 0
@@ -1519,6 +1529,11 @@ test_mapAccumEM = do
     intE <- joinDE =<< accumD mempty (mappend <$> eE)
     return $ eventToSignal intE
   r @?= [[0],[0],[],[1],[],[],[3],[],[],[],[6],[],[],[],[],[10]]
+
+test_mapAccumEquivalent = do
+  r1 <- mkAccumCount 10 mapAccumE id
+  r2 <- mkAccumCount 10 mapAccumEM return
+  r1 @?= r2
 
 shouldThrowOrderingViolation :: IO a -> Assertion
 shouldThrowOrderingViolation x = do
