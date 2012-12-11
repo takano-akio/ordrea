@@ -581,12 +581,8 @@ primDiscreteMemo (pull, notifier) = do
 
 primEventMemo :: (Pull [a], Notifier) -> Initialize (Pull [a], Notifier)
 primEventMemo (pull, notifier) = do
-  ref <- newRef Nothing
-  listenToNotifier (WeakKey ref) notifier $
-    writeRef ref . Just =<< pull
-  return (pullFromCache ref pull (resetCache ref), notifier)
-  where
-    resetCache ref = registerFini $ writeRef ref (Just [])
+  pull' <- primStepMemo pull
+  return (pull', notifier)
 
 listenToPullPush
   :: WeakKey
