@@ -4,6 +4,7 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE PatternGuards #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE DoRec #-}
 
 {-# OPTIONS_GHC -Wall #-}
 {-# OPTIONS_GHC -fno-warn-missing-signatures #-}
@@ -15,8 +16,8 @@ module FRP.Ordrea.Base
   , newExternalEvent, triggerExternalEvent, listenToExternalEvent
 
   , generatorE, filterE, stepClockE, dropStepE, eventFromList
-  , scanE, mapAccumE
-  , accumE, scanAccumE
+  , scanE, mapAccumE, mapAccumEM
+  , accumE, scanAccumE, scanAccumEM
   , mapMaybeE, justE, flattenE, expandE, externalE
   , takeWhileE
 
@@ -693,6 +694,18 @@ mapAccumE initial evt@(~(Evt evtprio _)) = do
   where
     prio = nextPrio evtprio
 
+mapAccumEM :: s -> Event (s -> SignalGen (s, a)) -> SignalGen (Event a)
+mapAccumEM initial evt = do
+  rec
+    e <- generatorE $ go <$> prevState <@> expandE evt
+    state <- accumD initial (const . fst <$> e)
+    prevState <- delayD initial state
+  return . flattenE $ snd <$> e
+  where
+  go :: s -> [s -> SignalGen (s, a)] -> SignalGen (s, [a])
+  go initial2 fs = do
+    foldM (\(s, as) f -> do (s', a) <- f s; return (s', as ++ [a])) (initial2, []) fs
+
 {-# DEPRECATED accumE "accumE has been renamed to scanE" #-}
 accumE :: a -> Event (a -> a) -> SignalGen (Event a)
 accumE = scanE
@@ -700,6 +713,10 @@ accumE = scanE
 {-# DEPRECATED scanAccumE "scanAccumE has been renamed to mapAccumE" #-}
 scanAccumE :: s -> Event (s -> (s, a)) -> SignalGen (Event a)
 scanAccumE = mapAccumE
+
+{-# DEPRECATED scanAccumEM "scanAccumEM has been renamed to mapAccumEM" #-}
+scanAccumEM :: s -> Event (s -> SignalGen (s, a)) -> SignalGen (Event a)
+scanAccumEM = mapAccumEM
 
 mapMaybeE :: (a -> Maybe b) -> Event a -> Event b
 mapMaybeE f = transformEvent (mapMaybe f)
@@ -1183,6 +1200,7 @@ _unitTest = runTestTT $ test
   , test_externalEvent
   , test_externalE
   , test_takeWhileE
+  , test_mapAccumEM
   ]
 
 test_signalFromList = do
@@ -1493,6 +1511,14 @@ test_takeWhileE = do
       case m'ref of
         Nothing -> return ()
         Just ref -> writeRef ref val
+
+test_mapAccumEM = do
+  r <- networkToList 16 $ do
+    evt <- eventFromList $ map pure $ iterate (+1) 0
+    eE <- mapAccumEM 0 ((\s n -> do e <- eventFromList (replicate n [] ++ [[n]]); return (n+s, e)) <$> evt)
+    intE <- joinDE =<< accumD mempty (mappend <$> eE)
+    return $ eventToSignal intE
+  r @?= [[0],[0],[],[1],[],[],[3],[],[],[],[6],[],[],[],[],[10]]
 
 shouldThrowOrderingViolation :: IO a -> Assertion
 shouldThrowOrderingViolation x = do
