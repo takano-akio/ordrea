@@ -18,6 +18,7 @@ module FRP.Ordrea.Base
   , scanE, mapAccumE
   , accumE, scanAccumE
   , mapMaybeE, justE, flattenE, expandE, externalE
+  , takeWhileE
 
   , joinDD, joinDE, joinDS
 
