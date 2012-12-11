@@ -674,7 +674,7 @@ eventTrigger buf notify mode occs = do
   whenPush mode notify
 
 transformEvent :: ([a] -> [b]) -> Event a -> Event b
-transformEvent f parent@(Evt evprio _) = Evt prio $ debugFrame "transformEvent" $ transparentMemoE $ do
+transformEvent f parent@(Evt evprio _) = Evt prio $ debugFrame "transformEvent" $ unsafeCache $ do
   (pullpush, trigger, key) <- newEventInit
   listenToEvent key parent prio $ \mode xs -> case f xs of
     [] -> do
@@ -907,7 +907,7 @@ pureDiscrete value = Dis (bottomPrio bottomLocation) $
 apDiscrete :: Discrete (a -> b) -> Discrete a -> Discrete b
 -- both arguments must have been memoized
 apDiscrete (Dis fprio fun) (Dis aprio arg)
-    = Dis prio $ debugFrame "apDiscrete" $ transparentMemoD $ do
+    = Dis prio $ debugFrame "apDiscrete" $ unsafeCache $ do
   dirtyRef <- newRef False
   isPullRef <- newRef False
   (pullpush, set, key) <- newDiscreteInit (error "apDiscrete: uninitialized")
@@ -1159,7 +1159,7 @@ signalToEvent (Sig sigprio sig) = Evt prio $ unsafeCache $ do
 
 applySE :: Signal (a -> b) -> Event a -> Event  b
 applySE (Sig fprio fun) arg@(Evt aprio _)
-    = Evt prio $ debugFrame "applySE" $ transparentMemoE $ do
+    = Evt prio $ debugFrame "applySE" $ unsafeCache $ do
   (pullpush, trigger, key) <- newEventInit
   funPull <- fun
   let
