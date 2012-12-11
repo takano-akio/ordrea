@@ -97,9 +97,18 @@ type Initialize = ReaderT IEnv IO
 type Run = ReaderT REnv IO
 type Cleanup = IO
 
+-- Signal, Event and Discrete are represented as a pair of a priority (see Note
+-- [Priority]) and an initialization action that returns the `core' of the
+-- node. The initialization action is idempotent.
+
 data Signal a   = Sig !Priority !(Initialize (Pull a))
+  --- ^ The pull contains the current value.
 data Event a    = Evt !Priority !(Initialize (Pull [a], Notifier))
+  --- ^ The pull contains the list of the current occurrences.
+  -- The Notifier is active iff the list is non-empty.
 data Discrete a = Dis !Priority !(Initialize (Pull a, Notifier))
+  --- ^ The pull contains the current value.
+  -- The Notifier is active iff the value might have changed.
 
 type Consumer a = a -> IO ()
 
@@ -116,7 +125,28 @@ whenPush Pull _ = return ()
 ----------------------------------------------------------------------
 -- locations and priorities
 
--- Location of a dynamic node.
+-- Note [Priority]
+-- ~~~~~~~~~~~~~~~
+--
+-- Each node in a network has a "Priority". A Priority tells when in an
+-- execution step the node will be updated. A smaller Priority means the node
+-- gets updated earlier. To be precise:
+--
+-- An execution step is divided into substeps, one for each priority in the
+-- network. An execution step begins with a substep for the minimum priority
+-- (bottomPrio bottomLocation) and ends with a substep for the maximum priority
+-- in the network. The following rules apply.
+--
+-- * A 'Pull' for a node with priority p will be ready after the substep for p
+--   is complete or after the accompanying Notifier is triggered. The user
+--   should not try to use the value before that.
+-- * A 'Notifier' for a node with priority p, if it's active, is triggered
+--   before the substep for p is complete. If it hasn't been triggered after
+--   the substep, the user can be sure that it's inactive in the current step.
+
+-- Location of a dynamic node. Each dynamic node gets a Location when it is
+-- created. A Location is not necessarily unique, i.e. two dynamic nodes may
+-- have the same Location.
 type Location = U.Vector Word
 
 -- Priority of updates.
@@ -136,12 +166,16 @@ data OrderingViolation = OrderingViolation String
 
 instance Exception OrderingViolation
 
+-- | The next smallest priority after the given one.
 nextPrio :: Priority -> Priority
 nextPrio prio@Priority{priNum=n} = prio{ priNum = n + 1 }
 
+-- | A special location which is never assigned to a dynamic node. Nodes that
+-- don't depend on any dynamic node use this location.
 bottomLocation :: Location
 bottomLocation = U.empty
 
+-- | The minimum priority under the given location.
 bottomPrio :: Location -> Priority
 bottomPrio loc = Priority
   { priLoc = loc
@@ -167,11 +201,15 @@ shouldBeGreaterThan x y = do
 ----------------------------------------------------------------------
 -- weak pointers
 
+-- | A Type-erasing wrapper for IORef. Its sole purpose is to serve as a key
+-- of a weak pointer.
 data WeakKey = forall a. WeakKey {-# UNPACK #-} !(IORef a)
 
+-- | Create a weak pointer using an IORef wrapped inside WeakKey.
 mkWeakWithKey :: WeakKey -> v -> IO (Weak v)
 mkWeakWithKey (WeakKey ref) v = mkWeakWithIORef ref v Nothing
 
+-- | Anything that can behave like a weak pointer.
 newtype WeakLike a = WeakLike (IO (Maybe a))
   deriving (Functor)
 
@@ -190,8 +228,23 @@ data GEnv = GEnv
   , envGenLocation :: IO Location
   }
 
+-- Note [Global preparation accumulator]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+--
+-- You can add actions to the global preparation accumulator, and they will be
+-- executed at the beginning of the next step. Added actions will be
+-- executed only once. It is global in the sense that subetworks see the same
+-- accumulator as its parent does.
+--
+-- Actions can be added anytime anywhere, even in different threads.
+
+-- | Run SignalGen in IO. Returns a pair of the result and an action
+-- to be performed in the first execution step for the new network.
 runSignalGen
-  :: Consumer (Run ()) -> Location -> Notifier -> SignalGen a
+  :: Consumer (Run ()) -- ^ see Note [Global preparation accumulator]
+  -> Location -- ^ the location of the parent node of this subnetwork
+  -> Notifier -- ^ the global clock notifier
+  -> SignalGen a -- ^ an action to create a (sub)network
   -> IO (a, Run ())
 runSignalGen regPrep parentLoc clock (SignalGen gen) = do
   (registerI, runAccumI) <- newActionAccum
@@ -206,6 +259,7 @@ runSignalGen regPrep parentLoc clock (SignalGen gen) = do
   (_, runAccumF) <- runInit parentLoc clock runAccumI
   return (result, runAccumF)
 
+-- | Run SignalGen in the Run monad, as part of an execution step.
 runSignalGenInStep :: SignalGen (Location -> Notifier -> SignalGen a -> Run a)
 runSignalGenInStep = do
   regPrep <- getPreparationAdder
@@ -214,6 +268,9 @@ runSignalGenInStep = do
     isolatingUpdates initial
     return result
 
+-- | Run a SignalGen action that constructs an independent network.
+-- Returns a pair of the result and an "preparation" action to be performed
+-- before each step.
 runSignalGenToplevel :: SignalGen (Initialize a) -> IO (a, Run ())
 runSignalGenToplevel gen = do
   (clock, clockTrigger) <- newNotifier
@@ -230,17 +287,22 @@ runSignalGenToplevel gen = do
   where
     addToPrep prepVar x = modifyMVar_ prepVar (\r -> return (x >> r))
 
+-- | Generate a new location.
 genLocation :: SignalGen Location
 genLocation = SignalGen $ do
   gen <- asks envGenLocation
   lift gen
 
+-- | Register an initialization action to be performed after this SignalGen
+-- is run.
 registerInit :: Initialize () -> SignalGen ()
 registerInit ini = SignalGen $ do
   reg <- asks envRegisterInit
   frm <- debugGetFrame
   lift $ reg $ debugPutFrame "init" frm ini
 
+-- | Get access to the global preparation accumulator. See Note [Global
+-- preparation accumulator].
 getPreparationAdder :: SignalGen (Run () -> IO ())
 getPreparationAdder = SignalGen $ asks envRegisterPrep
 
@@ -253,18 +315,24 @@ data IEnv = IEnv
   , envRegisterFirstStep :: Consumer (Run ())
   }
 
+-- | Register an action to be run in the first step for this network.
+-- If this is a subnetwork, it will be run immediately after the
+-- initialization phase.
 registerFirstStep :: Run () -> Initialize ()
 registerFirstStep action = do
   reg <- asks envRegisterFirstStep
   frm <- debugGetFrame
   lift $ reg $ debugPutFrame "fst" frm action
 
+-- | Get the global clock.
 getClock :: Initialize Notifier
 getClock = asks envClock
 
 _getParentLocation :: Initialize Location
 _getParentLocation = asks envParentLocation
 
+-- | Run Initialize. Returns a pair of the result and an action to
+-- be performed in the first execution step for the new network.
 runInit :: Location -> Notifier -> Initialize a -> IO (a, Run ())
 runInit parentLoc clock i = do
   (registerF, runAccumF) <- newActionAccum
@@ -295,6 +363,7 @@ data REnv = REnv
   , envPendingUpdates :: IORef (M.Map Priority (Run ())) -- TODO: use heap?
   }
 
+-- | Run Run.
 runRun :: Run a -> IO a
 runRun run = debugFrame "runRun" $ do
   (registerF, runAccumF) <- liftIO newActionAccum
@@ -316,22 +385,28 @@ runUpdates = debugFrame "runUpdates" $ asks envPendingUpdates >>= loop
       case M.minViewWithKey pending of
         Nothing -> return ()
         Just ((prio, upd), next) -> do
-          debug $ "running updates with prio " ++ show prio
+          debug $ "running substep for prio " ++ show prio
           writeRef pqueueRef next
           upd :: Run ()
           loop pqueueRef
 
+-- | Register an action to be executed during the next clean-up step.
 registerFini :: IO () -> Run ()
 registerFini fini = do
   reg <- asks envRegisterFini
   frm <- debugGetFrame
   lift $ reg $ debugPutFrame "fini" frm fini
 
+-- | Register an action to be executed in the substep for the specified
+-- priority. See Note [Priority].
 registerUpd :: Priority -> Run () -> Run ()
 registerUpd prio upd = do
   pqueueRef <- asks envPendingUpdates
   modifyRef pqueueRef $ M.insertWith' (>>) prio upd
 
+-- | @isolatingUpdates action@ runs @action@, and immediately executes
+-- those actions registered with 'registerUpd' inside @action@.
+-- TODO: remove it, this is a hack.
 isolatingUpdates :: Run a -> Run a
 isolatingUpdates action = do
   pqueueRef <- asks envPendingUpdates
@@ -348,15 +423,27 @@ isolatingUpdates action = do
 ----------------------------------------------------------------------
 -- push
 
-type Notifier = NotifierG Run
+-- | @NotifierG m@ lets you know when a particular type of event happens,
+-- if you registere a callback, which is an action in the Monad @m@.
 type NotifierG m = WeakLike (m ()) -> IO ()
 
+-- | Notifier is an instance of 'NotifierG' but gets a special treatment.
+-- A notifier is tied to a particular network, and it is triggered only
+-- during an execution step. It is triggered at most once per execution
+-- step. This way it virtually represents a boolean value. If it is triggered
+-- during an execution step it's active in that step, and inactive otherwise.
+type Notifier = NotifierG Run
+
+-- | Register a callback to be called when the notifier is triggered.
+-- It will be unregistered when the given WeakKey is invalidated.
 listenToNotifier :: WeakKey -> Notifier -> Run () -> Initialize ()
 listenToNotifier key push handler = do
   frm <- debugGetFrame
   weak <- liftIO $ mkWeakWithKey key (debugPutFrame "notifier" frm handler)
   liftIO $ push (weakToLike weak)
 
+-- | Register a one-time callback to be called when the notifier
+-- is triggered. It will be unregistered after one invocation.
 listenToNotifierOnce :: (MonadIO m) => Notifier -> Run () -> m ()
 listenToNotifierOnce push handler = do
   ref <- liftIO $ newIORef (0 :: Int)
@@ -367,6 +454,8 @@ listenToNotifierOnce push handler = do
       then Nothing
       else Just h'
 
+-- | Create a new notifier. It returns a pair of the notifier and
+-- a function to trigger it.
 newNotifier :: (Functor m, MonadIO m) => IO (NotifierG m, m ())
 newNotifier = do
   listenersRef <- newRef []
@@ -382,12 +471,18 @@ newNotifier = do
       where
         run1 weak = liftIO $ fmap ((,) weak) <$> deRefWeakLike weak
 
+-- | A notifier that never gets triggered.
 emptyNotifier :: Notifier
 emptyNotifier _weak = return ()
 
 ----------------------------------------------------------------------
 -- pull
 
+-- | A Pull reads the current value of a node. It must be idempotent
+-- within a step. That is, calling it twice in a single step should
+-- result in the same value, without much repeated overhead. A Pull
+-- should not be called when it's not ready; See Note [Priority] for
+-- details.
 type Pull a = Run a
 
 newCachedPull :: Initialize (Run a) -> SignalGen (Pull a)
