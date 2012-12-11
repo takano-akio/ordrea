@@ -21,7 +21,7 @@ module FRP.Ordrea.Base
 
   , joinDD, joinDE, joinDS
 
-  , start, externalS, joinS, delayS, signalFromList, networkToList
+  , start, externalS, joinS, delayS, delayD, signalFromList, networkToList
   , networkToListGC
 
   , accumD, changesD, preservesD
@@ -354,6 +354,16 @@ listenToNotifier key push handler = do
   frm <- debugGetFrame
   weak <- liftIO $ mkWeakWithKey key (debugPutFrame "notifier" frm handler)
   liftIO $ push (weakToLike weak)
+
+listenToNotifierOnce :: (MonadIO m) => Notifier -> Run () -> m ()
+listenToNotifierOnce push handler = do
+  ref <- liftIO $ newIORef (0 :: Int)
+  let h' = liftIO (modifyIORef ref (+1)) >> handler
+  liftIO $ push $ WeakLike $ do
+    n <- liftIO $ readIORef ref
+    return $ if n > 0
+      then Nothing
+      else Just h'
 
 newNotifier :: (Functor m, MonadIO m) => IO (NotifierG m, m ())
 newNotifier = do
@@ -949,6 +959,15 @@ delayS initial ~(Sig _sigprio sig) = do
   where
     prio = bottomPrio bottomLocation
 
+delayD :: a -> Discrete a -> SignalGen (Discrete a)
+delayD initial dis@ ~(Dis disprio _dis) = do
+  (dis2, _get, set, key) <- newDiscreteSG initial (bottomPrio bottomLocation)
+  registerInit $ do
+    clock <- getClock
+    listenToDiscrete key dis (nextPrio disprio) $ \_mode val ->
+      listenToNotifierOnce clock $ set Push val
+  return dis2
+
 signalFromList :: [a] -> SignalGen (Signal a)
 signalFromList xs = debugFrame "signalFromList" $ do
   clock <- dropStepE stepClockE
@@ -1140,6 +1159,7 @@ _unitTest = runTestTT $ test
   [ test_signalFromList
   , test_accumD
   , test_changesD
+  , test_delayD
   , test_mappendEvent
   , test_fmapEvent
   , test_filterE
@@ -1185,6 +1205,15 @@ test_changesD = do
   r @?= [[], [], ["<>/'f'/'o'/'o'/'b'/'a'/'z'"]]
   where
     append ch str = str ++ "/" ++ show ch
+
+test_delayD = do
+  r <- networkToList 5 $ do
+    nS <- signalFromList (map pure $ iterate (+1) 0)
+    nD <- accumD (0 :: Int) (const <$> signalToEvent nS)
+    nD' <- delayD (-1) nD
+    nE <- preservesD ((,) <$> nD <*> nD')
+    return $ eventToSignal nE
+  r @?= map pure [(0, -1), (1, 0), (2, 1), (3, 2), (4, 3)]
 
 test_mappendEvent = do
   r <- networkToListGC 3 $ do
