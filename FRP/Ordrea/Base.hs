@@ -23,10 +23,10 @@ module FRP.Ordrea.Base
 
   , joinDD, joinDE, joinDS
 
-  , start, externalS, joinS, delayS, delayD, signalFromList, networkToList
+  , start, externalS, joinS, delayS, signalFromList, networkToList
   , networkToListGC
 
-  , accumD, changesD, preservesD
+  , accumD, changesD, preservesD, delayD
 
   , eventToSignal, signalToEvent, applySE
 
@@ -977,15 +977,6 @@ delayS initial ~(Sig _sigprio sig) = do
   where
     prio = bottomPrio bottomLocation
 
-delayD :: a -> Discrete a -> SignalGen (Discrete a)
-delayD initial dis@ ~(Dis disprio _dis) = do
-  (dis2, _get, set, key) <- newDiscreteSG initial (bottomPrio bottomLocation)
-  registerInit $ do
-    clock <- getClock
-    listenToDiscrete key dis (nextPrio disprio) $ \_mode val ->
-      listenToNotifierOnce clock $ set Push val
-  return dis2
-
 signalFromList :: [a] -> SignalGen (Signal a)
 signalFromList xs = debugFrame "signalFromList" $ do
   clock <- dropStepE stepClockE
@@ -1036,6 +1027,15 @@ preservesD dis@ ~(Dis disprio _) = do
   return evt
   where
     prio = nextPrio disprio
+
+delayD :: a -> Discrete a -> SignalGen (Discrete a)
+delayD initial dis@ ~(Dis disprio _dis) = do
+  (dis2, _get, set, key) <- newDiscreteSG initial (bottomPrio bottomLocation)
+  registerInit $ do
+    clock <- getClock
+    listenToDiscrete key dis (nextPrio disprio) $ \_mode val ->
+      listenToNotifierOnce clock $ set Push val
+  return dis2
 
 ----------------------------------------------------------------------
 -- events and signals
