@@ -26,7 +26,7 @@ module FRP.Ordrea.Base
   , start, externalS, joinS, delayS, signalFromList, networkToList
   , networkToListGC
 
-  , accumD, preservesD, delayD
+  , accumD, changesD, preservesD, delayD
 
   , eventToSignal, signalToEvent, applySE
 
@@ -415,6 +415,8 @@ registerUpd prio upd = do
 -- Note [Priority]), you can know that the Push is inactive in this step.
 -- Thus Push is capable of communicating 'False' in O(0) time, which is
 -- the key to the asymptotic efficiency of the library.
+--
+-- The IORef contains whether this push has been triggered this generation.
 data Push = Push !(NotifierG Run) {-# UNPACk #-} !(IORef Bool)
 
 newPush :: IO (Push, Run ())
@@ -456,6 +458,9 @@ emptyPushRef :: IORef Bool
 emptyPushRef = unsafePerformIO $ newRef False
   -- noone should write to this
 {-# NOINLINE emptyPushRef #-}
+
+pushHasBeenTriggered :: Push -> Run Bool
+pushHasBeenTriggered (Push _ ref) = readRef ref
 
 -- | @NotifierG m@ lets you know when a particular type of event happens,
 -- if you registere a callback, which is an action in the Monad @m@.
@@ -1102,6 +1107,20 @@ accumD initial evt@(~(Evt evtprio _)) = do
   where
     prio = nextPrio evtprio
 
+changesD :: Discrete a -> Event a
+changesD (Dis disprio dis) = Evt prio $ unsafeCache $ do
+  ref <- newRef []
+  (disPull, disPush) <- dis
+  let upd = eventTrigger ref (return ()) . (:[]) =<< disPull
+  listenToPush (WeakKey ref) disPush upd
+  runInCurrentStep (return ()) $ do
+    -- If we are in a step, we need to set up the ref now.
+    active <- pushHasBeenTriggered disPush
+    when active upd
+  return (readRef ref, disPush)
+  where
+    prio = nextPrio disprio
+
 preservesD :: Discrete a -> SignalGen (Event a)
 preservesD dis@ ~(Dis disprio _) = do
   (evt, trigger, key) <- newEventSG prio
@@ -1258,6 +1277,7 @@ _unitTest = runTestTT $ test
   [ test_signalFromList
   , test_signalToEvent
   , test_accumD
+  , test_changesD
   , test_delayD
   , test_mappendEvent
   , test_fmapEvent
@@ -1303,6 +1323,15 @@ test_accumD = do
     accD <- accumD "<>" $ append <$> signalToEvent strS
     return $ discreteToSignal accD
   r @?= ["<>/'f'/'o'/'o'", "<>/'f'/'o'/'o'", "<>/'f'/'o'/'o'/'b'/'a'/'z'"]
+  where
+    append ch str = str ++ "/" ++ show ch
+
+test_changesD = do
+  r <- networkToList 3 $ do
+    strS <- signalFromList ["foo", "", "baz"]
+    accD <- accumD "<>" $ append <$> signalToEvent strS
+    return $ eventToSignal $ changesD accD
+  r @?= [["<>/'f'/'o'/'o'"], [], ["<>/'f'/'o'/'o'/'b'/'a'/'z'"]]
   where
     append ch str = str ++ "/" ++ show ch
 
