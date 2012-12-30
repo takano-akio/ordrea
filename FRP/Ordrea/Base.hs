@@ -103,12 +103,12 @@ type Cleanup = IO
 
 data Signal a   = Sig !Priority !(Initialize (Pull a))
   --- ^ The pull contains the current value.
-data Event a    = Evt !Priority !(Initialize (Pull [a], Notifier))
+data Event a    = Evt !Priority !(Initialize (Pull [a], Push))
   --- ^ The pull contains the list of the current occurrences.
-  -- The Notifier is active iff the list is non-empty.
-data Discrete a = Dis !Priority !(Initialize (Pull a, Notifier))
+  -- The Push is active iff the list is non-empty.
+data Discrete a = Dis !Priority !(Initialize (Pull a, Push))
   --- ^ The pull contains the current value.
-  -- The Notifier is active iff the value might have changed.
+  -- The Push is active iff the value might have changed.
 
 type Consumer a = a -> IO ()
 
@@ -128,7 +128,7 @@ type Consumer a = a -> IO ()
 -- in the network. The following rules apply.
 --
 -- * A 'Pull' for a node with priority p will be ready after the substep for p
---   is complete or after the accompanying Notifier is triggered. The user
+--   is complete or after the accompanying Push is triggered. The user
 --   should not try to use the value before that.
 -- * A 'Notifier' for a node with priority p, if it's active, is triggered
 --   before the substep for p is complete. If it hasn't been triggered after
@@ -233,7 +233,7 @@ data GEnv = GEnv
 runSignalGen
   :: Consumer (Run ()) -- ^ see Note [Global preparation accumulator]
   -> Location -- ^ the location of the parent node of this subnetwork
-  -> Notifier -- ^ the global clock notifier
+  -> Push -- ^ the global clock notifier
   -> Maybe REnv -- ^ the Run env if we are in an execution step
   -> SignalGen a -- ^ an action to create a (sub)network
   -> IO a
@@ -252,7 +252,7 @@ runSignalGen regPrep parentLoc clock curStep (SignalGen gen) = do
   return result
 
 -- | Run SignalGen in the Run monad, as part of an execution step.
-runSignalGenInStep :: SignalGen (Location -> Notifier -> SignalGen a -> Run a)
+runSignalGenInStep :: SignalGen (Location -> Push -> SignalGen a -> Run a)
 runSignalGenInStep = do
   regPrep <- getPreparationAdder
   return $ \parentLoc clock sgen -> debugFrame "SGenInStep" $ do
@@ -264,7 +264,7 @@ runSignalGenInStep = do
 -- before each step.
 runSignalGenToplevel :: SignalGen (Initialize a) -> IO (a, Run ())
 runSignalGenToplevel gen = do
-  (clock, clockTrigger) <- newNotifier
+  (clock, clockTrigger) <- newPush
   prepVar <- newMVar (prepClock clockTrigger)
   val <- debugFrame "toplevel" $ do
     ref <- newRef undefined
@@ -300,21 +300,21 @@ getPreparationAdder = SignalGen $ asks envGRegisterPrep
 -- Initialize monad
 
 data IEnv = IEnv
-  { envClock :: Notifier
+  { envClock :: Push
   , envParentLocation :: Location
   , envIRegisterPrep :: Consumer (Run ())
   , envICurrentStep :: Maybe REnv
   }
 
 -- | Get the global clock.
-getClock :: Initialize Notifier
+getClock :: Initialize Push
 getClock = asks envClock
 
 _getParentLocation :: Initialize Location
 _getParentLocation = asks envParentLocation
 
 -- | Run Initialize
-runInit :: Location -> Notifier -> Maybe REnv -> Consumer (Run ()) -> Initialize a -> IO a
+runInit :: Location -> Push -> Maybe REnv -> Consumer (Run ()) -> Initialize a -> IO a
 runInit parentLoc clock curStep regPrep i = do
   let
     ienv = IEnv
@@ -408,36 +408,58 @@ registerUpd prio upd = do
 ----------------------------------------------------------------------
 -- push
 
--- | @NotifierG m@ lets you know when a particular type of event happens,
--- if you registere a callback, which is an action in the Monad @m@.
-type NotifierG m = WeakLike (m ()) -> IO ()
+-- | Push is a time-dependent boolean in a network. It is either True (active)
+-- or False (inactive) in a given step. If you register a listener function
+-- beforehand, it will be invoked once if the Push is active in the step.
+-- If your function is not invoked during the time window it would be (see
+-- Note [Priority]), you can know that the Push is inactive in this step.
+-- Thus Push is capable of communicating 'False' in O(0) time, which is
+-- the key to the asymptotic efficiency of the library.
+data Push = Push !(NotifierG Run) {-# UNPACk #-} !(IORef Bool)
 
--- | Notifier is an instance of 'NotifierG' but gets a special treatment.
--- A notifier is tied to a particular network, and it is triggered only
--- during an execution step. It is triggered at most once per execution
--- step. This way it virtually represents a boolean value. If it is triggered
--- during an execution step it's active in that step, and inactive otherwise.
-type Notifier = NotifierG Run
+newPush :: IO (Push, Run ())
+newPush = do
+  (notifier, triggerPush) <- newNotifier
+  activeRef <- newRef False
+  let
+    trigger = do
+      writeRef activeRef True
+      triggerPush
+      registerFini $ writeRef activeRef False
+  return (Push notifier activeRef, trigger)
 
--- | Register a callback to be called when the notifier is triggered.
+-- | Register a callback to be called when the push is triggered.
 -- It will be unregistered when the given WeakKey is invalidated.
-listenToNotifier :: (MonadIO m) => WeakKey -> Notifier -> Run () -> m ()
-listenToNotifier key push handler = do
+listenToPush :: (MonadIO m) => WeakKey -> Push -> Run () -> m ()
+listenToPush key (Push register _) handler = do
   frm <- debugGetFrame
   weak <- liftIO $ mkWeakWithKey key (debugPutFrame "notifier" frm handler)
-  liftIO $ push (weakToLike weak)
+  liftIO $ register (weakToLike weak)
 
 -- | Register a one-time callback to be called when the notifier
 -- is triggered. It will be unregistered after one invocation.
-listenToNotifierOnce :: (MonadIO m) => Notifier -> Run () -> m ()
-listenToNotifierOnce push handler = do
+listenToPushOnce :: (MonadIO m) => Push -> Run () -> m ()
+listenToPushOnce (Push register _) handler = do
   ref <- liftIO $ newIORef (0 :: Int)
   let h' = liftIO (modifyIORef ref (+1)) >> handler
-  liftIO $ push $ WeakLike $ do
+  liftIO $ register $ WeakLike $ do
     n <- liftIO $ readIORef ref
     return $ if n > 0
       then Nothing
       else Just h'
+
+-- | A push that is always inactive.
+emptyPush :: Push
+emptyPush = Push emptyNotifier emptyPushRef
+
+emptyPushRef :: IORef Bool
+emptyPushRef = unsafePerformIO $ newRef False
+  -- noone should write to this
+{-# NOINLINE emptyPushRef #-}
+
+-- | @NotifierG m@ lets you know when a particular type of event happens,
+-- if you registere a callback, which is an action in the Monad @m@.
+type NotifierG m = WeakLike (m ()) -> IO ()
 
 -- | Create a new notifier. It returns a pair of the notifier and
 -- a function to trigger it.
@@ -456,9 +478,8 @@ newNotifier = do
       where
         run1 weak = liftIO $ fmap ((,) weak) <$> deRefWeakLike weak
 
--- | A notifier that never gets triggered.
-emptyNotifier :: Notifier
-emptyNotifier _weak = return ()
+emptyNotifier :: NotifierG m
+emptyNotifier _ = return ()
 
 ----------------------------------------------------------------------
 -- pull
@@ -545,26 +566,26 @@ const' x _ = x
 {-# NOINLINE const' #-}
 
 transparentMemoD
-  :: Initialize (Pull a, Notifier)
-  -> Initialize (Pull a, Notifier)
+  :: Initialize (Pull a, Push)
+  -> Initialize (Pull a, Push)
 transparentMemoD orig = unsafeProtectFromDup primDiscreteMemo orig
 
 transparentMemoE
-  :: Initialize (Pull [a], Notifier)
-  -> Initialize (Pull [a], Notifier)
+  :: Initialize (Pull [a], Push)
+  -> Initialize (Pull [a], Push)
 transparentMemoE orig = unsafeProtectFromDup primEventMemo orig
 
 transparentMemoS :: Initialize (Pull a) -> Initialize (Pull a)
 transparentMemoS orig = unsafeProtectFromDup primStepMemo orig
 
-primDiscreteMemo :: (Pull a, Notifier) -> Initialize (Pull a, Notifier)
+primDiscreteMemo :: (Pull a, Push) -> Initialize (Pull a, Push)
 primDiscreteMemo (pull, notifier) = do
   ref <- newRef Nothing
-  listenToNotifier (WeakKey ref) notifier $
+  listenToPush (WeakKey ref) notifier $
     writeRef ref . Just =<< pull
   return (pullFromCache ref pull (return ()), notifier)
 
-primEventMemo :: (Pull [a], Notifier) -> Initialize (Pull [a], Notifier)
+primEventMemo :: (Pull [a], Push) -> Initialize (Pull [a], Push)
 primEventMemo (pull, notifier) = do
   pull' <- primStepMemo pull
   return (pull', notifier)
@@ -572,7 +593,7 @@ primEventMemo (pull, notifier) = do
 listenToPullPush
   :: WeakKey
   -> Pull a
-  -> Notifier
+  -> Push
   -> Priority
   -> (a -> Run ())
   -> Initialize ()
@@ -581,7 +602,7 @@ listenToPullPush key pull notifier prio handler = do
   runInStep $ registerUpd prio $ do
     handler =<< pull
     liftIO $ addPrep $
-      listenToNotifier key notifier $ handler =<< pull
+      listenToPush key notifier $ handler =<< pull
 
 ----------------------------------------------------------------------
 -- external events
@@ -638,14 +659,14 @@ listenToEvent key (Evt evtprio evt) prio handler = debugFrame "listenToEvent" $ 
 newEventSG :: Priority -> SignalGen (Event a, [a] -> Run (), WeakKey)
 newEventSG prio = do
   ref <- newRef []
-  (push, trigger) <- liftIO newNotifier
+  (push, trigger) <- liftIO newPush
   let evt = Evt prio $ return (eventPull ref, push)
   return (evt, eventTrigger ref trigger, WeakKey ref)
 
-newEventInit :: Initialize ((Pull [a], Notifier), [a] -> Run (), WeakKey)
+newEventInit :: Initialize ((Pull [a], Push), [a] -> Run (), WeakKey)
 newEventInit = do
   ref <- newRef []
-  (push, trigger) <- liftIO newNotifier
+  (push, trigger) <- liftIO newPush
   return ((eventPull ref, push), eventTrigger ref trigger, WeakKey ref)
 
 eventPull :: IORef [a] -> Pull [a]
@@ -715,7 +736,7 @@ mergeEvents evts = Evt prio $ unsafeCache $ do
     evtPrio (Evt p _) = p
 
 emptyEvent :: Event a
-emptyEvent = Evt (bottomPrio bottomLocation) $ return (return [], emptyNotifier)
+emptyEvent = Evt (bottomPrio bottomLocation) $ return (return [], emptyPush)
 
 filterE :: (a -> Bool) -> Event a -> Event a
 filterE p = transformEvent (filter p)
@@ -732,7 +753,7 @@ dropStepE ~(Evt evtprio evt) = do
   addPrep <- getPreparationAdder
   registerInit $ do
     (getoccs, evtnotifier) <- evt
-    runInStep $ liftIO $ addPrep $ listenToNotifier key evtnotifier $ do
+    runInStep $ liftIO $ addPrep $ listenToPush key evtnotifier $ do
       occs <- getoccs
       when (not $ null occs) $ trigger occs
   return result
@@ -828,7 +849,7 @@ externalE ee = do
 
 takeWhileE :: (a -> Bool) -> Event a -> SignalGen (Event a)
 takeWhileE cond ~(Evt evtprio evt) = do
-  (push, trigger) <- liftIO $ newNotifier
+  (push, trigger) <- liftIO $ newPush
   ref <- newRef $ error "takeWhileE"
   registerInit $ do
     (evtPull, evtNot) <- evt
@@ -859,10 +880,10 @@ instance Applicative Discrete where
 
 newDiscreteInit
   :: a
-  -> Initialize ((Pull a, Notifier), a -> Run (), WeakKey)
+  -> Initialize ((Pull a, Push), a -> Run (), WeakKey)
 newDiscreteInit initial = do
   ref <- newRef initial
-  (push, trigger) <- liftIO newNotifier
+  (push, trigger) <- liftIO newPush
   return ((readRef ref, push), discreteTrigger ref trigger, WeakKey ref)
 
 newDiscreteSG
@@ -871,7 +892,7 @@ newDiscreteSG
   -> SignalGen (Discrete a, Run a, a -> Run (), WeakKey)
 newDiscreteSG initial prio = do
   ref <- newRef initial
-  (push, trigger) <- liftIO newNotifier
+  (push, trigger) <- liftIO newPush
   let dis = Dis prio $ return (readRef ref, push)
   return (dis, readRef ref, discreteTrigger ref trigger, WeakKey ref)
 
@@ -889,7 +910,7 @@ mapDiscrete f (Dis dprio dis) = Dis prio $ debugFrame "mapDiscrete" $ transparen
 
 pureDiscrete :: a -> Discrete a
 pureDiscrete value = Dis (bottomPrio bottomLocation) $
-  return (pure value, emptyNotifier)
+  return (pure value, emptyPush)
 
 apDiscrete :: Discrete (a -> b) -> Discrete a -> Discrete b
 -- both arguments must have been memoized
@@ -933,7 +954,7 @@ joinDD outer@ ~(Dis outerprio _) = do
   here <- genLocation
   let prio = bottomPrio here
   outerRef <- newRef $ error "joinDD: outerRef not initialized"
-  (push, trigger) <- liftIO newNotifier
+  (push, trigger) <- liftIO newPush
   registerInit $ do
     prio `shouldBeGreaterThan` outerprio
     runSubinit <- makeSubinitializer here
@@ -955,7 +976,7 @@ joinDE outer@ ~(Dis outerprio _) = do
   here <- genLocation
   let prio = bottomPrio here
   outerRef <- newRef $ error "joinDE: outerRef not initialized"
-  (push, trigger) <- liftIO newNotifier
+  (push, trigger) <- liftIO newPush
   registerInit $ do
     prio `shouldBeGreaterThan` outerprio
     runSubinit <- makeSubinitializer here
@@ -1040,7 +1061,7 @@ delayS initial ~(Sig _sigprio sig) = do
   registerInit $ do
     clock <- getClock
     pull <- sig
-    registerNextStep $ listenToNotifier (WeakKey ref) clock $ do
+    registerNextStep $ listenToPush (WeakKey ref) clock $ do
       newVal <- pull
       registerFini $ writeRef ref newVal
   return $ Sig prio $ return $ readRef ref
@@ -1095,7 +1116,7 @@ delayD initial dis@ ~(Dis disprio _dis) = do
   registerInit $ do
     clock <- getClock
     listenToDiscrete key dis (nextPrio disprio) $ \val ->
-      listenToNotifierOnce clock $ set val
+      listenToPushOnce clock $ set val
   return dis2
 
 ----------------------------------------------------------------------
