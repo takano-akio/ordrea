@@ -67,12 +67,14 @@ import FRP.Ordrea.Weak
 --
 -- * Construction (SignalGen monad)
 --   The construction phase is the first step to construct a new
---   (sub)network. In this phase, new nodes are created and a fresh location
---   is assigned to each dynamic node. This is the only phase the user
---   describes directly.
+--   (sub)network. In this phase, a fresh location is assigned to each dynamic
+--   node to be constructed. 'delay' nodes are created in this phase.
+--   This is the only phase the user describes directly.
 -- * Initialization (Initialize monad)
---   This phase completes construction of a new (sub)network. Nodes are
---   connected together in this phase.
+--   This phase completes construction of a new (sub)network. Non-delay nodes
+--   are created and all nodes get connected together. Initialization happens
+--   when a SignalGen run for a (sub)network is completed, or when 'snapshot'
+--   is called in a SignalGen run.
 -- * Execution step (Run monad)
 --   This phase updates internal states of the network, moving the
 --   computation one step forward.
@@ -496,12 +498,6 @@ emptyNotifier _ = return ()
 -- details.
 type Pull a = Run a
 
-newCachedPull :: Initialize (Run a) -> SignalGen (Pull a)
-newCachedPull gencalc = do
-  actionRef <- newRef (error "newCachedPull: not initialized")
-  registerInit $ writeRef actionRef =<< primStepMemo =<< gencalc
-  return $ join $ readRef actionRef
-
 pullFromCache
   :: IORef (Maybe a)
   -> Run a
@@ -553,7 +549,21 @@ unsafeProtectFromDup protect base = unsafeCache (base >>= protect)
 --
 -- Note that this function is not referentially transparent.
 unsafeCache :: Initialize a -> Initialize a
-unsafeCache action = do
+unsafeCache action = cacheWith cacheRef action
+  where
+    cacheRef = unsafeDupablePerformIO $ newIORef (const' Nothing action)
+    {-# NOINLINE cacheRef #-}
+{-# NOINLINE unsafeCache #-}
+
+-- | Non-inlinable version of const, only useful to prevent optimization.
+const' :: a -> b -> a
+const' x _ = x
+{-# NOINLINE const' #-}
+
+-- | Return an idempotent version of the given initialization action using
+-- the given IORef as a cache.
+cacheWith :: IORef (Maybe a) -> Initialize a -> Initialize a
+cacheWith cacheRef action = do
   cache <- readRef cacheRef
   case cache of
     Just val -> return val
@@ -561,14 +571,6 @@ unsafeCache action = do
       val <- action
       writeRef cacheRef (Just val)
       return val
-  where
-    cacheRef = unsafeDupablePerformIO $ newIORef (const' Nothing action)
-{-# NOINLINE unsafeCache #-}
-
--- | Non-inlinable version of const, only useful to prevent optimization.
-const' :: a -> b -> a
-const' x _ = x
-{-# NOINLINE const' #-}
 
 transparentMemoD
   :: Initialize (Pull a, Push)
@@ -608,6 +610,20 @@ listenToPullPush key pull notifier prio handler = do
     handler =<< pull
     liftIO $ addPrep $
       listenToPush key notifier $ handler =<< pull
+
+-- | Create a new node in the OrderGen monad, using the given initialization
+-- action. The initialization action is probably time dependent, otherwise
+-- you can make it a pure function rather than a SignalGen function.
+-- The given initialization action is guaranteed to run exactly once,
+-- before this construction step ends.
+newNode
+  :: Initialize a
+  -> SignalGen (Initialize a)
+newNode action = do
+  ref <- newRef Nothing
+  let act' = cacheWith ref action
+  registerInit $ act' >> return ()
+  return act'
 
 ----------------------------------------------------------------------
 -- external events
@@ -710,13 +726,13 @@ generatorE :: Event (SignalGen a) -> SignalGen (Event a)
 generatorE evt = do
   here <- genLocation
   let prio = bottomPrio here
-  (result, trigger, key) <- newEventSG prio
   runSG <- runSignalGenInStep
-  registerInit $ do
+  fmap (Evt prio) $ newNode $ do
+    (pullpush, trigger, key) <- newEventInit
     clock <- getClock
     listenToEvent key evt prio $ \gens ->
       trigger =<< mapM (runSG here clock) gens
-  return result
+    return pullpush
 
 mergeEvents :: [Event a] -> Event a
 mergeEvents [] = emptyEvent
@@ -752,16 +768,15 @@ stepClockE = Evt (bottomPrio bottomLocation) $ do
   return (pure [()], clock)
 
 dropStepE :: Event a -> SignalGen (Event a)
-dropStepE ~(Evt evtprio evt) = do
-  (result, trigger, key) <- newEventSG prio
-
+dropStepE ~(Evt evtprio evt) = Evt prio <$> do
   addPrep <- getPreparationAdder
-  registerInit $ do
+  newNode $ do
+    (result, trigger, key) <- newEventInit
     (getoccs, evtnotifier) <- evt
     runInStep $ liftIO $ addPrep $ listenToPush key evtnotifier $ do
       occs <- getoccs
       when (not $ null occs) $ trigger occs
-  return result
+    return result
   where
     prio = nextPrio evtprio
 
@@ -769,24 +784,24 @@ eventFromList :: [[a]] -> SignalGen (Event a)
 eventFromList occs = signalToEvent <$> signalFromList (occs ++ repeat [])
 
 scanE :: a -> Event (a -> a) -> SignalGen (Event a)
-scanE initial evt@(~(Evt evtprio _)) = do
-  (myevt, trigger, key) <- newEventSG prio
+scanE initial evt@(~(Evt evtprio _)) = fmap (Evt prio) $ newNode $ do
+  (pullpush, trigger, key) <- newEventInit
   ref <- newRef initial
-  registerInit $ listenToEvent key evt prio $ \occs -> do
+  listenToEvent key evt prio $ \occs -> do
     debug $ "accumE: occs=" ++ show (length occs)
     oldVal <- readRef ref
     let _:vals = scanl (flip ($)) oldVal occs
     writeRef ref $ last vals
     trigger vals
-  return myevt
+  return pullpush
   where
     prio = nextPrio evtprio
 
 mapAccumE :: s -> Event (s -> (s, a)) -> SignalGen (Event a)
-mapAccumE initial evt@(~(Evt evtprio _)) = do
-  (myevt, trigger, key) <- newEventSG prio
+mapAccumE initial evt@(~(Evt evtprio _)) = fmap (Evt prio) $ newNode $ do
+  (myevt, trigger, key) <- newEventInit
   ref <- newRef initial
-  registerInit $ listenToEvent key evt prio $ \occs -> do
+  listenToEvent key evt prio $ \occs -> do
     debug $ "mapAccumE: occs=" ++ show (length occs)
     oldVal <- readRef ref
     let (newVal, occs') = mapAccumL (flip ($)) oldVal occs
@@ -853,23 +868,22 @@ externalE ee = do
     prio = bottomPrio bottomLocation
 
 takeWhileE :: (a -> Bool) -> Event a -> SignalGen (Event a)
-takeWhileE cond ~(Evt evtprio evt) = do
+takeWhileE cond ~(Evt evtprio evt) = fmap (Evt prio) $ newNode $ do
   (push, trigger) <- liftIO $ newPush
   ref <- newRef $ error "takeWhileE"
-  registerInit $ do
-    (evtPull, evtNot) <- evt
-    subref <- newRef evtPull
-    writeRef ref ([], Just subref)
-    listenToPullPush (WeakKey subref) evtPull evtNot prio $ \occs -> do
-      (_, eventRef) <- readRef ref
-      when (isJust eventRef) $ do
-        let !(occs', rest) = span cond occs
-        when (not $ null occs') $ do
-          modifyRef ref $ \(_, y) -> (occs', y)
-          trigger
-          registerFini $ modifyRef ref $ \(_, y) -> ([], y)
-        when (not $ null rest) $ registerFini $ writeRef ref ([], Nothing)
-  return $ Evt prio $ return (fst <$> readRef ref, push)
+  (evtPull, evtNot) <- evt
+  subref <- newRef evtPull
+  writeRef ref ([], Just subref)
+  listenToPullPush (WeakKey subref) evtPull evtNot prio $ \occs -> do
+    (_, eventRef) <- readRef ref
+    when (isJust eventRef) $ do
+      let !(occs', rest) = span cond occs
+      when (not $ null occs') $ do
+        modifyRef ref $ \(_, y) -> (occs', y)
+        trigger
+        registerFini $ modifyRef ref $ \(_, y) -> ([], y)
+      when (not $ null rest) $ registerFini $ writeRef ref ([], Nothing)
+  return (fst <$> readRef ref, push)
   where
     prio = nextPrio evtprio
 
@@ -960,7 +974,7 @@ joinDD outer@ ~(Dis outerprio _) = do
   let prio = bottomPrio here
   outerRef <- newRef $ error "joinDD: outerRef not initialized"
   (push, trigger) <- liftIO newPush
-  registerInit $ do
+  fmap (Dis prio) $ newNode $ do
     prio `shouldBeGreaterThan` outerprio
     runSubinit <- makeSubinitializer here
     listenToDiscrete (WeakKey outerRef) outer prio $ \inner -> do
@@ -974,7 +988,7 @@ joinDD outer@ ~(Dis outerprio _) = do
             debug $ "joinDD: inner"
             writeRef innerRef val
             trigger
-  return $ Dis prio $ return (readRef outerRef >>= readRef, push)
+    return (readRef outerRef >>= readRef, push)
 
 joinDE :: Discrete (Event a) -> SignalGen (Event a)
 joinDE outer@ ~(Dis outerprio _) = do
@@ -982,7 +996,7 @@ joinDE outer@ ~(Dis outerprio _) = do
   let prio = bottomPrio here
   outerRef <- newRef $ error "joinDE: outerRef not initialized"
   (push, trigger) <- liftIO newPush
-  registerInit $ do
+  fmap (Evt prio) $ newNode $ do
     prio `shouldBeGreaterThan` outerprio
     runSubinit <- makeSubinitializer here
     listenToDiscrete (WeakKey outerRef) outer prio $ \inner -> do
@@ -997,14 +1011,14 @@ joinDE outer@ ~(Dis outerprio _) = do
             writeRef innerRef occs
             registerFini $ writeRef innerRef []
             trigger
-  return $ Evt prio $ return (readRef outerRef >>= readRef, push)
+    return (readRef outerRef >>= readRef, push)
 
 joinDS :: Discrete (Signal a) -> SignalGen (Signal a)
 joinDS outer@ ~(Dis outerprio _) = do
   here <- genLocation
   let prio = bottomPrio here
   outerRef <- newRef $ error "joinDS: outerRef not initialized"
-  registerInit $ do
+  fmap (Sig prio) $ newNode $ do
     prio `shouldBeGreaterThan` outerprio
     runSubinit <- makeSubinitializer here
     listenToDiscrete (WeakKey outerRef) outer prio
@@ -1014,7 +1028,7 @@ joinDS outer@ ~(Dis outerprio _) = do
         prio `shouldBeGreaterThan` innerprio
         sig
       writeRef outerRef pull
-  return $ Sig prio $ return (readRef outerRef >>= id)
+    return (readRef outerRef >>= id)
 
 ----------------------------------------------------------------------
 -- signals
@@ -1042,23 +1056,21 @@ start gensig = do
     debugFrame "getval" getval
 
 externalS :: IO a -> SignalGen (Signal a)
-externalS get = do
-  pull <- newCachedPull $ return $ liftIO get
-  return $ Sig (bottomPrio bottomLocation) $ return pull
+externalS get = fmap (Sig (bottomPrio bottomLocation)) $
+  newNode $ primStepMemo (liftIO get)
 
 joinS :: Signal (Signal a) -> SignalGen (Signal a)
 joinS ~(Sig _sigsigprio sigsig) = do
   here <- genLocation
   let prio = bottomPrio here
-  pull <- newCachedPull $ do
+  fmap (Sig prio) $ newNode $ do
     debug $ "joinS: making pull; prio=" ++ show prio
     runSubinit <- makeSubinitializer here
     sigpull <- sigsig
-    return $ debugFrame ("joinS.pull[prio=" ++ show prio ++ "]") $ do
+    primStepMemo $ do
       Sig _sigprio sig <- sigpull
       pull <- runSubinit sig
       debugFrame "pull" pull
-  return $! Sig prio $ return pull
 
 delayS :: a -> Signal a -> SignalGen (Signal a)
 delayS initial ~(Sig _sigprio sig) = do
@@ -1096,14 +1108,13 @@ networkToListGC count network = do
 -- events and discretes
 
 accumD :: a -> Event (a -> a) -> SignalGen (Discrete a)
-accumD initial evt@(~(Evt evtprio _)) = do
-  debug $ "accumD: creating; prio=" ++ show prio
-  (dis, get, set, key) <- newDiscreteSG initial prio
-  registerInit $ listenToEvent key evt prio $ \occs -> do
+accumD initial evt@(~(Evt evtprio _)) = fmap (Dis prio) $ newNode $ do
+  (pullpush@(get, _), set, key) <- newDiscreteInit initial
+  listenToEvent key evt prio $ \occs -> do
     debug $ "accumD: prio=" ++ show prio ++ "; occs=" ++ show (length occs)
     oldVal <- get
     set $! foldl' (flip ($)) oldVal occs
-  return dis
+  return pullpush
   where
     prio = nextPrio evtprio
 
@@ -1122,9 +1133,9 @@ changesD (Dis disprio dis) = Evt prio $ unsafeCache $ do
     prio = nextPrio disprio
 
 preservesD :: Discrete a -> SignalGen (Event a)
-preservesD dis@ ~(Dis disprio _) = do
-  (evt, trigger, key) <- newEventSG prio
-  registerInit $ listenToDiscrete key dis prio $ \val -> trigger [val]
+preservesD dis@ ~(Dis disprio _) = fmap (Evt prio) $ newNode $ do
+  (evt, trigger, key) <- newEventInit
+  listenToDiscrete key dis prio $ \val -> trigger [val]
   return evt
   where
     prio = nextPrio disprio
