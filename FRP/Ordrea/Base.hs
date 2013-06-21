@@ -1073,14 +1073,16 @@ joinS ~(Sig _sigsigprio sigsig) = do
       debugFrame "pull" pull
 
 delayS :: a -> Signal a -> SignalGen (Signal a)
-delayS initial ~(Sig _sigprio sig) = do
+delayS initial ~(Sig sigprio sig) = do
   ref <- newRef initial
   registerInit $ do
     clock <- getClock
     pull <- sig
-    registerNextStep $ listenToPush (WeakKey ref) clock $ do
-      newVal <- pull
-      registerFini $ writeRef ref newVal
+    registerNextStep $ listenToPush (WeakKey ref) clock $
+      registerUpd (nextPrio sigprio) $ do
+        debug "delayS: pull"
+        newVal <- pull
+        registerFini $ writeRef ref newVal
   return $ Sig prio $ return $ readRef ref
   where
     prio = bottomPrio bottomLocation
@@ -1303,6 +1305,7 @@ _unitTest = runTestTT $ test
   , test_eventFromList
   , test_preservesD
   , test_joinS
+  , test_delayS
   , test_generatorE
   , test_generatorE1
   , test_accumE
@@ -1446,6 +1449,12 @@ test_joinS = do
     sigSig <- signalFromList [sig0, sig3, sig2, sig1]
     joinS sigSig
   r @?= [1, 32, 23, 14]
+
+test_delayS = do
+  r <- networkToListGC 4 $ do
+    sig <- signalFromList [1, 2, 3, 4::Int]
+    delayS (-1) sig
+  r @?= [-1, 1, 2, 3]
 
 test_generatorE = do
   r <- networkToListGC 4 $ do
