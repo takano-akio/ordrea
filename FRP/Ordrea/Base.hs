@@ -4,7 +4,7 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE PatternGuards #-}
 {-# LANGUAGE BangPatterns #-}
-{-# LANGUAGE DoRec #-}
+{-# LANGUAGE RecursiveDo #-}
 
 {-# OPTIONS_GHC -Wall #-}
 {-# OPTIONS_GHC -fno-warn-missing-signatures #-}
@@ -812,11 +812,10 @@ mapAccumE initial evt@(~(Evt evtprio _)) = fmap (Evt prio) $ newNode $ do
     prio = nextPrio evtprio
 
 mapAccumEM :: s -> Event (s -> SignalGen (s, a)) -> SignalGen (Event a)
-mapAccumEM initial evt = do
-  rec
-    e <- generatorE $ go <$> prevState <@> expandE evt
-    state <- accumD initial (const . fst <$> e)
-    prevState <- delayD initial state
+mapAccumEM initial evt = mdo
+  e <- generatorE $ go <$> prevState <@> expandE evt
+  state <- accumD initial (const . fst <$> e)
+  prevState <- delayD initial state
   return . flattenE $ snd <$> e
   where
   go :: s -> [s -> SignalGen (s, a)] -> SignalGen (s, [a])
