@@ -32,7 +32,7 @@ module FRP.Ordrea.Base
 
   , discreteToSignal
 
-  , TimeFunction(..), (<@>)
+  , TimeFunction(..), (<@>), (<@)
   ) where
 
 import Control.Applicative
@@ -1204,7 +1204,7 @@ discreteToSignal (Dis prio dis) = Sig prio $ fst <$> dis
 ----------------------------------------------------------------------
 -- classes
 
-class TimeFunction s where
+class Functor s => TimeFunction s where
   toSignal :: s a -> Signal a
 
 instance TimeFunction Signal where
@@ -1217,6 +1217,9 @@ infixl 4 <@> -- same as <$> and <*>
 
 (<@>) :: (TimeFunction s) => s (a -> b) -> Event a -> Event b
 f <@> a = applySE (toSignal f) a
+
+(<@) :: (TimeFunction s) => s b -> Event a -> Event b
+v <@ a = const <$> v <@> a
 
 ----------------------------------------------------------------------
 -- utils
