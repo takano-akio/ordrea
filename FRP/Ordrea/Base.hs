@@ -19,7 +19,7 @@ module FRP.Ordrea.Base
   , scanE, mapAccumE, mapAccumEM
   , accumE, scanAccumE, scanAccumEM
   , mapMaybeE, justE, flattenE, expandE, externalE
-  , takeWhileE
+  , takeWhileE, delayE
 
   , joinDD, joinDE, joinDS
 
@@ -886,6 +886,13 @@ takeWhileE cond ~(Evt evtprio evt) = fmap (Evt prio) $ newNode $ do
   where
     prio = nextPrio evtprio
 
+-- | @delayE evt@ creates an event whose occurrences at step N
+-- is equal to the ocurrences of @evt@ at step N-1.
+delayE :: Event a -> SignalGen (Event a)
+delayE evt = do
+  occsS <- delayS [] $ eventToSignal evt
+  return $ flattenE $ occsS <@ stepClockE
+
 ----------------------------------------------------------------------
 -- discretes
 
@@ -1321,6 +1328,7 @@ _unitTest = runTestTT $ test
   , test_mapAccumE
   , test_mapAccumEM
   , test_mapAccumEquivalent
+  , test_delayE
   ]
 
 test_signalFromList = do
@@ -1670,6 +1678,12 @@ test_mapAccumEquivalent = do
   r1 <- mkAccumCount 10 mapAccumE id
   r2 <- mkAccumCount 10 mapAccumEM return
   r1 @?= r2
+
+test_delayE = do
+  r <- networkToList 4 $ do
+    evt <- eventFromList ["ab", "", "c", "d"]
+    eventToSignal <$> delayE evt
+  r @?= ["", "ab", "", "c"]
 
 shouldThrowOrderingViolation :: IO a -> Assertion
 shouldThrowOrderingViolation x = do
