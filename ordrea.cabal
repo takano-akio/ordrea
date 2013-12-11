@@ -3,8 +3,19 @@
 
 name:                ordrea
 version:             0.1.0.1
-synopsis:            Push-based discrete-time FRP
--- description:         
+synopsis:            Push-pull implementation of discrete-time FRP
+description:         This is an FRP library with the following characteristics:
+                     .
+                     * classical: it has first-class signals
+                     .
+                     * synchronous: it has a clear notion of simultaneous events
+                     .
+                     * higher-order: signals inside signals can be flattened
+                     to get a switching behavior
+                     .
+                     * push-based: inactive events has zero runtime costs
+                     .
+                     This package is in the alpha stage.
 license:             PublicDomain
 license-file:        LICENSE
 author:              Takano Akio, Andrew Richards
@@ -16,7 +27,7 @@ cabal-version:       >=1.8
 
 library
   exposed-modules:     FRP.Ordrea, FRP.Ordrea.Weak, FRP.Ordrea.Base
-  build-depends:       base >= 4.5, transformers >= 0.3, containers >= 0.4, vector >= 0.9
+  build-depends:       base >= 4.5 && < 5, transformers >= 0.3, containers >= 0.4, vector >= 0.9
 
 test-suite unit-tests
   type:              exitcode-stdio-1.0
@@ -24,3 +35,7 @@ test-suite unit-tests
   hs-source-dirs:    tests
   other-modules:     Tests.Base
   build-depends:     base, ordrea, HUnit >= 1.2
+
+source-repository head
+  type: git
+  location: https://github.com/takano-akio/ordrea.git
