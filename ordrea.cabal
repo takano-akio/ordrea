@@ -15,6 +15,12 @@ build-type:          Simple
 cabal-version:       >=1.8
 
 library
-  exposed-modules:     FRP.Ordrea
-  other-modules:       FRP.Ordrea.Weak, FRP.Ordrea.Base     
-  build-depends:       base >= 4.5, transformers >= 0.3, containers >= 0.4, vector >= 0.9, HUnit >= 1.2
+  exposed-modules:     FRP.Ordrea, FRP.Ordrea.Weak, FRP.Ordrea.Base
+  build-depends:       base >= 4.5, transformers >= 0.3, containers >= 0.4, vector >= 0.9
+
+test-suite unit-tests
+  type:              exitcode-stdio-1.0
+  main-is:           unit.hs
+  hs-source-dirs:    tests
+  other-modules:     Tests.Base
+  build-depends:     base, ordrea, HUnit >= 1.2
