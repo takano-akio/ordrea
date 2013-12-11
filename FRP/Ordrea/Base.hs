@@ -6,6 +6,7 @@
 {-# LANGUAGE RecursiveDo #-}
 
 {-# OPTIONS_GHC -Wall #-}
+-- | This is an internal module.
 module FRP.Ordrea.Base
   ( SignalGen
   , Signal, Event, Discrete
