@@ -1,17 +1,19 @@
-import qualified Tests.Base as Base
-
+import Control.Applicative
 import Control.Monad
-import Test.HUnit
-import System.Exit
+import Data.List.Split
+import System.Process
 
 main :: IO ()
 main = do
-  c <- runTestTT tests
-  print c
-  when ((errors c, failures c) /= (0, 0))
-    exitFailure
-
-tests :: Test
-tests = test
-  [ "base" ~: Base.tests
-  ]
+  files <- endBy "\0" <$> readProcess
+    "find"
+    [ "-name", "*.hs"
+    , "-exec", "grep", "-q", "^_unitTest", "{}", ";"
+    , "-print0"
+    ] ""
+  forM_ files $ \file -> do
+    putStrLn $ "Running unit tests in " ++ file
+    rawSystem "ghc"
+      [ "-e", "_unitTest"
+      , file
+      ]

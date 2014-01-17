@@ -8,7 +8,6 @@
 -- If you use ghci, compile this file first and then
 -- load the .o file to ghci.
 
--- | This is an internal module.
 module FRP.Ordrea.Weak (mkWeakWithIORef) where
 
 import GHC.Exts
