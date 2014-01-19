@@ -25,7 +25,7 @@ module FRP.Ordrea.Base
   , start, externalS, joinS, delayS, signalFromList, networkToList
   , networkToListGC
 
-  , accumD, changesD, preservesD, delayD
+  , scanD, changesD, preservesD, delayD
 
   , eventToSignal, signalToEvent, applySE
 
@@ -815,7 +815,7 @@ mapAccumE initial evt@(~(Evt evtprio _)) = fmap (Evt prio) $ newNode $ do
 mapAccumEM :: s -> Event (s -> SignalGen (s, a)) -> SignalGen (Event a)
 mapAccumEM initial evt = mdo
   e <- generatorE $ go <$> prevState <@> expandE evt
-  state <- accumD initial (const . fst <$> e)
+  state <- scanD initial (const . fst <$> e)
   prevState <- delayD initial state
   return . flattenE $ snd <$> e
   where
@@ -1097,7 +1097,7 @@ delayS initial ~(Sig sigprio sig) = do
 signalFromList :: [a] -> SignalGen (Signal a)
 signalFromList xs = debugFrame "signalFromList" $ do
   clock <- dropStepE stepClockE
-  suffixD <- accumD xs $ drop 1 <$ clock
+  suffixD <- scanD xs $ drop 1 <$ clock
   return $ discreteToSignal $ hd <$> suffixD
   where
     hd = fromMaybe (error "listToSignal: list exhausted") .
@@ -1116,11 +1116,11 @@ networkToListGC count network = do
 ----------------------------------------------------------------------
 -- events and discretes
 
-accumD :: a -> Event (a -> a) -> SignalGen (Discrete a)
-accumD initial evt@(~(Evt evtprio _)) = fmap (Dis prio) $ newNode $ do
+scanD :: a -> Event (a -> a) -> SignalGen (Discrete a)
+scanD initial evt@(~(Evt evtprio _)) = fmap (Dis prio) $ newNode $ do
   (pullpush@(get, _), set, key) <- newDiscreteInit initial
   listenToEvent key evt prio $ \occs -> do
-    debug $ "accumD: prio=" ++ show prio ++ "; occs=" ++ show (length occs)
+    debug $ "scanD: prio=" ++ show prio ++ "; occs=" ++ show (length occs)
     oldVal <- get
     set $! foldl' (flip ($)) oldVal occs
   return pullpush
@@ -1302,7 +1302,7 @@ tests :: Test
 tests = test
   [ test_signalFromList
   , test_signalToEvent
-  , test_accumD
+  , test_scanD
   , test_changesD
   , test_delayD
   , test_mappendEvent
@@ -1348,10 +1348,10 @@ test_signalToEvent = do
     return $ eventToSignal $ signalToEvent s0
   r @?= ["foo", "", "baz"]
 
-test_accumD = do
+test_scanD = do
   r <- networkToList 3 $ do
     strS <- signalFromList ["foo", "", "baz"]
-    accD <- accumD "<>" $ append <$> signalToEvent strS
+    accD <- scanD "<>" $ append <$> signalToEvent strS
     return $ discreteToSignal accD
   r @?= ["<>/'f'/'o'/'o'", "<>/'f'/'o'/'o'", "<>/'f'/'o'/'o'/'b'/'a'/'z'"]
   where
@@ -1360,7 +1360,7 @@ test_accumD = do
 test_changesD = do
   r <- networkToList 3 $ do
     strS <- signalFromList ["foo", "", "baz"]
-    accD <- accumD "<>" $ append <$> signalToEvent strS
+    accD <- scanD "<>" $ append <$> signalToEvent strS
     return $ eventToSignal $ changesD accD
   r @?= [["<>/'f'/'o'/'o'"], [], ["<>/'f'/'o'/'o'/'b'/'a'/'z'"]]
   where
@@ -1369,7 +1369,7 @@ test_changesD = do
 test_delayD = do
   r <- networkToList 5 $ do
     nS <- signalFromList (map pure $ iterate (+1) 0)
-    nD <- accumD (0 :: Int) (const <$> signalToEvent nS)
+    nD <- scanD (0 :: Int) (const <$> signalToEvent nS)
     nD' <- delayD (-1) nD
     nE <- preservesD ((,) <$> nD <*> nD')
     return $ eventToSignal nE
@@ -1378,7 +1378,7 @@ test_delayD = do
 test_mappendEvent = do
   r <- networkToListGC 3 $ do
     strS <- signalFromList ["foo", "", "baz"]
-    accD <- accumD "<>" $ append <$> signalToEvent strS
+    accD <- scanD "<>" $ append <$> signalToEvent strS
     ch <- preservesD accD
     return $ eventToSignal $
       ch `mappend` (signalToEvent $ (:[]) <$> strS)
@@ -1424,8 +1424,8 @@ test_apDiscrete = do
   r <- networkToListGC 4 $ do
     ev0 <- signalToEvent <$> signalFromList [[], [], [1::Int], [2,3]]
     ev1 <- signalToEvent <$> signalFromList [[], [4], [], [5]]
-    dis0 <- accumD 0 $ max <$> ev0
-    dis1 <- accumD 0 $ max <$> ev1
+    dis0 <- scanD 0 $ max <$> ev0
+    dis1 <- scanD 0 $ max <$> ev1
     let dis = (*) <$> dis0 <*> dis1
     eventToSignal <$> preservesD dis
   r @?= [[0], [0], [4], [15]]
@@ -1434,8 +1434,8 @@ test_apDiscrete1 = do
   r <- networkToListGC 4 $ do
     ev0 <- eventFromList [[], [], [2::Int], [3,4]]
     ev1 <- eventFromList [[-1], [7], [], [11]]
-    dis0 <- accumD 1 $ const <$> ev0
-    dis1 <- accumD 1 $ const <$> ev1
+    dis0 <- scanD 1 $ const <$> ev0
+    dis1 <- scanD 1 $ const <$> ev1
     let dis = (*) <$> dis0 <*> dis1
     return $ discreteToSignal dis
   r @?= [-1, 7, 14, 44]
@@ -1449,7 +1449,7 @@ test_eventFromList = do
 test_preservesD = do
   r <- networkToListGC 3 $ do
     ev <- eventFromList [[], [], [3,4::Int]]
-    dis <- accumD 0 (const <$> ev)
+    dis <- scanD 0 (const <$> ev)
     ev1 <- preservesD dis
     return $ eventToSignal ev1
   r @?= [[0], [], [4]]
@@ -1486,7 +1486,7 @@ test_generatorE1 = do
   r <- networkToListGC 4 $ do
     evEv <- generatorE =<<
       eventFromList [[subnet 0], [subnet 1, subnet 2], [], [subnet 3]]
-    dEv <- accumD mempty $ const <$> evEv
+    dEv <- scanD mempty $ const <$> evEv
     ev <- joinDE dEv
     return $ eventToSignal ev
   r @?= [[1], [21], [22, 23], [31]]
@@ -1539,7 +1539,7 @@ test_joinDD = do
 
     discrete initial list = do
       evt <- eventFromList list
-      accumD initial $ const <$> evt
+      scanD initial $ const <$> evt
 
 test_joinDE = do
   r <- networkToList 5 net
@@ -1555,7 +1555,7 @@ test_joinDE = do
 
     discrete initial list = do
       evt <- eventFromList list
-      accumD initial $ const <$> evt
+      scanD initial $ const <$> evt
 
 test_joinDS = do
   r <- networkToList 4 net
@@ -1571,14 +1571,14 @@ test_joinDS = do
 
     discrete initial list = do
       evt <- eventFromList list
-      accumD initial $ const <$> evt
+      scanD initial $ const <$> evt
 
 test_mfix = do
   r <- networkToList 3 net
   r @?= [1, 6, 30]
   where
     net = fmap snd $ mfix $ \ ~(e', _) -> do
-      r <- accumD 1 $ (*) <$> e'
+      r <- scanD 1 $ (*) <$> e'
       e <- eventFromList [[], [2,3], [5::Int]]
       return (e, discreteToSignal r)
 
@@ -1591,7 +1591,7 @@ test_orderingViolation_joinDS = do
     net = fmap snd $ mfix $ \ ~(sd', _) -> do
       s <- joinDS sd'
       se <- eventFromList [[], [pure 1], [s]]
-      sd <- accumD (pure 0) $ const <$> se
+      sd <- scanD (pure 0) $ const <$> se
       return (sd, s)
 
 test_externalEvent = do
@@ -1677,7 +1677,7 @@ test_mapAccumEM = do
   r <- networkToList 16 $ do
     evt <- eventFromList $ map pure $ iterate (+1) 0
     eE <- mapAccumEM 0 ((\s n -> do e <- eventFromList (replicate n [] ++ [[n]]); return (n+s, e)) <$> evt)
-    intE <- joinDE =<< accumD mempty (mappend <$> eE)
+    intE <- joinDE =<< scanD mempty (mappend <$> eE)
     return $ eventToSignal intE
   r @?= [[0],[0],[],[1],[],[],[3],[],[],[],[6],[],[],[],[],[10]]
 

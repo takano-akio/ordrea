@@ -23,7 +23,7 @@ module FRP.Ordrea
   , networkToListGC
 
   -- * Discretes
-  , accumD, changesD, preservesD, delayD
+  , scanD, changesD, preservesD, delayD
 
   -- * Signal-event functions
   , eventToSignal, signalToEvent, applySE
