@@ -17,6 +17,7 @@ module FRP.Ordrea
   , mapMaybeE, justE, flattenE, expandE, externalE
   , takeWhileE, delayE
   , withPrevE, dropE, dropWhileE, takeE
+  , partitionEithersE, leftsE, rightsE
 
   -- * Switchers
   , joinDD, joinDE, joinDS
@@ -80,6 +81,21 @@ takeE n evt = do
     countdown occ k = (k', (k', occ))
       where
         !k' = k - 1
+
+partitionEithersE :: Event (Either a b) -> (Event a, Event b)
+partitionEithersE evt = (leftsE evt, rightsE evt)
+
+leftsE :: Event (Either a b) -> Event a
+leftsE evt = mapMaybeE f evt
+  where
+    f (Left x) = Just x
+    f Right{} = Nothing
+
+rightsE :: Event (Either a b) -> Event b
+rightsE evt = mapMaybeE f evt
+  where
+    f (Right x) = Just x
+    f Left{} = Nothing
 
 ----------------------------------------------------------------------
 -- tests
