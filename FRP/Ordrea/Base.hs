@@ -1335,7 +1335,7 @@ tests = test
   ]
 
 _skipped =
-  [ test_takeWhileE -- broken
+  [ test_takeWhileE -- broken when compiled. why???
   ]
 
 test_signalFromList = do
