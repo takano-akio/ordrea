@@ -16,7 +16,7 @@ module FRP.Ordrea
   , accumE, scanAccumE, scanAccumEM
   , mapMaybeE, justE, flattenE, expandE, externalE
   , takeWhileE, delayE
-  , withPrevE, dropE, dropWhileE
+  , withPrevE, dropE, dropWhileE, takeE
 
   -- * Switchers
   , joinDD, joinDE, joinDS
@@ -72,6 +72,15 @@ dropWhileE p evt = justE <$> mapAccumE True (f <$> evt)
       | p occ = (True, Nothing)
     f occ _ = (False, Just occ)
 
+takeE :: Int -> Event a -> SignalGen (Event a)
+takeE n evt = do
+  evtWithCount <- mapAccumE n (countdown <$> evt)
+  fmap snd <$> takeWhileE ((>0) . fst) evtWithCount
+  where
+    countdown occ k = (k', (k', occ))
+      where
+        !k' = k - 1
+
 ----------------------------------------------------------------------
 -- tests
 
@@ -79,6 +88,7 @@ _unitTest = runTestTT $ test
   [ test_withPrevE
   , test_dropE
   , test_dropWhileE
+  , test_takeE
   ]
 
 test_withPrevE = do
@@ -99,3 +109,10 @@ test_dropWhileE = do
       =<< eventFromList [[1,2], [], [3,4 :: Int]]
     return $ eventToSignal evt
   r @?= [[], [], [3,4]]
+
+test_takeE = do
+  r <- networkToList 3 $ do
+    evt <- takeE 3
+      =<< eventFromList [[1,2], [], [3,4 :: Int]]
+    return $ eventToSignal evt
+  r @?= [[1,2], [], [3]]
