@@ -4,7 +4,7 @@ module FRP.Ordrea
   (
   -- * Basic types
     SignalGen
-  , Signal, Event, Discrete
+  , Behavior, Event, Discrete
 
   -- * External events
   , ExternalEvent
@@ -20,21 +20,21 @@ module FRP.Ordrea
   , partitionEithersE, leftsE, rightsE
 
   -- * Switchers
-  , joinDD, joinDE, joinDS
+  , joinDD, joinDE, joinDB
 
-  -- * Signals
-  , start, externalS, joinS, delayS, signalFromList, networkToList
+  -- * Behaviors
+  , start, externalB, joinB, delayB, behaviorFromList, networkToList
   , networkToListGC
 
   -- * Discretes
   , scanD, changesD, preservesD, delayD
   , stepperD
 
-  -- * Signal-event functions
-  , eventToSignal, signalToEvent, applySE
+  -- * Behavior-event functions
+  , eventToBehavior, behaviorToEvent, applyBE
 
-  -- * Signal-discrete functions
-  , discreteToSignal
+  -- * Behavior-discrete functions
+  , discreteToBehavior
 
   -- * Overloaded functions
   , TimeFunction(..), (<@>), (<@)
@@ -110,25 +110,25 @@ _unitTest = runTestTT $ test
 test_withPrevE = do
   r <- networkToList 3 $ do
     evt <- withPrevE 0 =<< eventFromList [[1,2], [], [3 :: Int]]
-    return $ eventToSignal evt
+    return $ eventToBehavior evt
   r @?= [[(1,0), (2,1)], [], [(3,2)]]
 
 test_dropE = do
   r <- networkToList 3 $ do
     evt <- dropE 1 =<< eventFromList [[1,2], [], [3 :: Int]]
-    return $ eventToSignal evt
+    return $ eventToBehavior evt
   r @?= [[2], [], [3]]
 
 test_dropWhileE = do
   r <- networkToList 3 $ do
     evt <- dropWhileE (<=2)
       =<< eventFromList [[1,2], [], [3,4 :: Int]]
-    return $ eventToSignal evt
+    return $ eventToBehavior evt
   r @?= [[], [], [3,4]]
 
 test_takeE = do
   r <- networkToList 3 $ do
     evt <- takeE 3
       =<< eventFromList [[1,2], [], [3,4 :: Int]]
-    return $ eventToSignal evt
+    return $ eventToBehavior evt
   r @?= [[1,2], [], [3]]
