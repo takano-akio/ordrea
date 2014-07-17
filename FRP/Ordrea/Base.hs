@@ -9,7 +9,7 @@
 {-# OPTIONS_GHC -Wall -fno-warn-missing-signatures #-}
 module FRP.Ordrea.Base
   ( SignalGen
-  , Signal, Event, Discrete
+  , Behavior, Event, Discrete
 
   , ExternalEvent
   , newExternalEvent, triggerExternalEvent, listenToExternalEvent
@@ -20,16 +20,16 @@ module FRP.Ordrea.Base
   , mapMaybeE, justE, flattenE, expandE, externalE
   , takeWhileE, delayE
 
-  , joinDD, joinDE, joinDS
+  , joinDD, joinDE, joinDB
 
-  , start, externalS, joinS, delayS, signalFromList, networkToList
+  , start, externalB, joinB, delayB, behaviorFromList, networkToList
   , networkToListGC
 
   , scanD, changesD, preservesD, delayD
 
-  , eventToSignal, signalToEvent, applySE
+  , eventToBehavior, behaviorToEvent, applyBE
 
-  , discreteToSignal
+  , discreteToBehavior
 
   , TimeFunction(..), (<@>), (<@)
 
@@ -100,11 +100,11 @@ type Initialize = ReaderT IEnv IO
 type Run = ReaderT REnv IO
 type Cleanup = IO
 
--- Signal, Event and Discrete are represented as a pair of a priority (see Note
+-- Behavior, Event and Discrete are represented as a pair of a priority (see Note
 -- [Priority]) and an initialization action that returns the `core' of the
 -- node. The initialization action is idempotent.
 
-data Signal a   = Sig !Priority !(Initialize (Pull a))
+data Behavior a   = Beh !Priority !(Initialize (Pull a))
   --- ^ The pull contains the current value.
 data Event a    = Evt !Priority !(Initialize (Pull [a], Push))
   --- ^ The pull contains the list of the current occurrences.
@@ -782,7 +782,7 @@ dropStepE ~(Evt evtprio evt) = Evt prio <$> do
     prio = nextPrio evtprio
 
 eventFromList :: [[a]] -> SignalGen (Event a)
-eventFromList occs = signalToEvent <$> signalFromList (occs ++ repeat [])
+eventFromList occs = behaviorToEvent <$> behaviorFromList (occs ++ repeat [])
 
 scanE :: a -> Event (a -> a) -> SignalGen (Event a)
 scanE initial evt@(~(Evt evtprio _)) = fmap (Evt prio) $ newNode $ do
@@ -891,7 +891,7 @@ takeWhileE cond ~(Evt evtprio evt) = fmap (Evt prio) $ newNode $ do
 -- is equal to the ocurrences of @evt@ at step N-1.
 delayE :: Event a -> SignalGen (Event a)
 delayE evt = do
-  occsS <- delayS [] $ eventToSignal evt
+  occsS <- delayB [] $ eventToBehavior evt
   return $ flattenE $ occsS <@ stepClockE
 
 ----------------------------------------------------------------------
@@ -1020,17 +1020,17 @@ joinDE outer@ ~(Dis outerprio _) = do
             trigger
     return (readRef outerRef >>= readRef, push)
 
-joinDS :: Discrete (Signal a) -> SignalGen (Signal a)
-joinDS outer@ ~(Dis outerprio _) = do
+joinDB :: Discrete (Behavior a) -> SignalGen (Behavior a)
+joinDB outer@ ~(Dis outerprio _) = do
   here <- genLocation
   let prio = bottomPrio here
-  outerRef <- newRef $ error "joinDS: outerRef not initialized"
-  fmap (Sig prio) $ newNode $ do
+  outerRef <- newRef $ error "joinDB: outerRef not initialized"
+  fmap (Beh prio) $ newNode $ do
     prio `shouldBeGreaterThan` outerprio
     runSubinit <- makeSubinitializer here
     listenToDiscrete (WeakKey outerRef) outer prio
-        $ \(Sig innerprio sig) -> do
-      debug $ "joinDS: outer"
+        $ \(Beh innerprio sig) -> do
+      debug $ "joinDB: outer"
       pull <- runSubinit $ do
         prio `shouldBeGreaterThan` innerprio
         sig
@@ -1038,23 +1038,23 @@ joinDS outer@ ~(Dis outerprio _) = do
     return (readRef outerRef >>= id)
 
 ----------------------------------------------------------------------
--- signals
+-- behaviors
 
-instance Functor Signal where
-  fmap f (Sig prio pull) = Sig prio $ transparentMemoS $ fmap f <$> pull
+instance Functor Behavior where
+  fmap f (Beh prio pull) = Beh prio $ transparentMemoS $ fmap f <$> pull
 
-instance Applicative Signal where
-  pure x = Sig (bottomPrio bottomLocation) (return $ pure x)
-  Sig f_prio f_init <*> Sig a_prio a_init =
-      Sig (max f_prio a_prio) $ transparentMemoS $ do
+instance Applicative Behavior where
+  pure x = Beh (bottomPrio bottomLocation) (return $ pure x)
+  Beh f_prio f_init <*> Beh a_prio a_init =
+      Beh (max f_prio a_prio) $ transparentMemoS $ do
     f_pull <- f_init
     a_pull <- a_init
     return $ f_pull <*> a_pull
 
-start :: SignalGen (Signal a) -> IO (IO a)
+start :: SignalGen (Behavior a) -> IO (IO a)
 start gensig = do
   (getval, prep) <- runSignalGenToplevel $ do
-    Sig _ sig <- gensig
+    Beh _ sig <- gensig
     return $ sig
   return $ runRun $ debugFrame "step" $ do
     debug "step"
@@ -1062,53 +1062,53 @@ start gensig = do
     runUpdates
     debugFrame "getval" getval
 
-externalS :: IO a -> SignalGen (Signal a)
-externalS get = fmap (Sig (bottomPrio bottomLocation)) $
+externalB :: IO a -> SignalGen (Behavior a)
+externalB get = fmap (Beh (bottomPrio bottomLocation)) $
   newNode $ primStepMemo (liftIO get)
 
-joinS :: Signal (Signal a) -> SignalGen (Signal a)
-joinS ~(Sig _sigsigprio sigsig) = do
+joinB :: Behavior (Behavior a) -> SignalGen (Behavior a)
+joinB ~(Beh _sigsigprio sigsig) = do
   here <- genLocation
   let prio = bottomPrio here
-  fmap (Sig prio) $ newNode $ do
-    debug $ "joinS: making pull; prio=" ++ show prio
+  fmap (Beh prio) $ newNode $ do
+    debug $ "joinB: making pull; prio=" ++ show prio
     runSubinit <- makeSubinitializer here
     sigpull <- sigsig
     primStepMemo $ do
-      Sig _sigprio sig <- sigpull
+      Beh _sigprio sig <- sigpull
       pull <- runSubinit sig
       debugFrame "pull" pull
 
-delayS :: a -> Signal a -> SignalGen (Signal a)
-delayS initial ~(Sig sigprio sig) = do
+delayB :: a -> Behavior a -> SignalGen (Behavior a)
+delayB initial ~(Beh sigprio sig) = do
   ref <- newRef initial
   registerInit $ do
     clock <- getClock
     pull <- sig
     registerNextStep $ listenToPush (WeakKey ref) clock $
       registerUpd (nextPrio sigprio) $ do
-        debug "delayS: pull"
+        debug "delayB: pull"
         newVal <- pull
         registerFini $ writeRef ref newVal
-  return $ Sig prio $ return $ readRef ref
+  return $ Beh prio $ return $ readRef ref
   where
     prio = bottomPrio bottomLocation
 
-signalFromList :: [a] -> SignalGen (Signal a)
-signalFromList xs = debugFrame "signalFromList" $ do
+behaviorFromList :: [a] -> SignalGen (Behavior a)
+behaviorFromList xs = debugFrame "behaviorFromList" $ do
   clock <- dropStepE stepClockE
   suffixD <- scanD xs $ drop 1 <$ clock
-  return $ discreteToSignal $ hd <$> suffixD
+  return $ discreteToBehavior $ hd <$> suffixD
   where
-    hd = fromMaybe (error "listToSignal: list exhausted") .
+    hd = fromMaybe (error "listtoBehavior: list exhausted") .
       listToMaybe
 
-networkToList :: Int -> SignalGen (Signal a) -> IO [a]
+networkToList :: Int -> SignalGen (Behavior a) -> IO [a]
 networkToList count network = do
   smp <- start network
   replicateM count smp
 
-networkToListGC :: Int -> SignalGen (Signal a) -> IO [a]
+networkToListGC :: Int -> SignalGen (Behavior a) -> IO [a]
 networkToListGC count network = do
   smp <- start network
   replicateM count (performGC >> smp)
@@ -1159,16 +1159,16 @@ delayD initial dis@ ~(Dis disprio _dis) = do
   return dis2
 
 ----------------------------------------------------------------------
--- events and signals
+-- events and behaviors
 
-eventToSignal :: Event a -> Signal [a]
-eventToSignal (Evt prio evt) = Sig prio $ do
+eventToBehavior :: Event a -> Behavior [a]
+eventToBehavior (Evt prio evt) = Beh prio $ do
   (pull, _push) <- evt
   return pull
 
-signalToEvent :: Signal [a] -> Event a
-signalToEvent (Sig sigprio sig) = Evt prio $ unsafeCache $ do
-  debug "signalToEvent"
+behaviorToEvent :: Behavior [a] -> Event a
+behaviorToEvent (Beh sigprio sig) = Evt prio $ unsafeCache $ do
+  debug "behaviorToEvent"
   sigpull <- sig
   (pullpush, trigger, key) <- newEventInit
     --- ^ Here we create a fresh event, even though its pull component
@@ -1179,25 +1179,25 @@ signalToEvent (Sig sigprio sig) = Evt prio $ unsafeCache $ do
   listenToPullPush key (return ()) clock prio $ \_ ->
     registerUpd prio $ do
       occs <- sigpull
-      debug $ "signalToEvent: onclock prio=" ++ show prio
+      debug $ "behaviorToEvent: onclock prio=" ++ show prio
         ++ "; noccs=" ++ show (length occs)
       when (not $ null occs) $ trigger occs
   return pullpush
   where
     prio = nextPrio sigprio
 
-applySE :: Signal (a -> b) -> Event a -> Event  b
-applySE (Sig fprio fun) arg@(Evt aprio _)
-    = Evt prio $ debugFrame "applySE" $ unsafeCache $ do
+applyBE :: Behavior (a -> b) -> Event a -> Event  b
+applyBE (Beh fprio fun) arg@(Evt aprio _)
+    = Evt prio $ debugFrame "applyBE" $ unsafeCache $ do
   (pullpush, trigger, key) <- newEventInit
   funPull <- fun
   let
     upd occs = do
-      debug $ "applySE; prio=" ++ show prio
+      debug $ "applyBE; prio=" ++ show prio
       funVal <- funPull
       trigger $ map funVal occs
   listenToEvent key arg prio $ \occs -> do
-    debug $ "applySE: prio=" ++ show prio
+    debug $ "applyBE: prio=" ++ show prio
     registerUpd prio $ upd occs
   return pullpush
   where
@@ -1205,27 +1205,27 @@ applySE (Sig fprio fun) arg@(Evt aprio _)
     prio = nextPrio srcprio
 
 ----------------------------------------------------------------------
--- discretes and signals
+-- discretes and behaviors
 
-discreteToSignal :: Discrete a -> Signal a
-discreteToSignal (Dis prio dis) = Sig prio $ fst <$> dis
+discreteToBehavior :: Discrete a -> Behavior a
+discreteToBehavior (Dis prio dis) = Beh prio $ fst <$> dis
 
 ----------------------------------------------------------------------
 -- classes
 
 class Functor s => TimeFunction s where
-  toSignal :: s a -> Signal a
+  toBehavior :: s a -> Behavior a
 
-instance TimeFunction Signal where
-  toSignal = id
+instance TimeFunction Behavior where
+  toBehavior = id
 
 instance TimeFunction Discrete where
-  toSignal = discreteToSignal
+  toBehavior = discreteToBehavior
 
 infixl 4 <@> -- same as <$> and <*>
 
 (<@>) :: (TimeFunction s) => s (a -> b) -> Event a -> Event b
-f <@> a = applySE (toSignal f) a
+f <@> a = applyBE (toBehavior f) a
 
 (<@) :: (TimeFunction s) => s b -> Event a -> Event b
 v <@ a = const <$> v <@> a
@@ -1300,8 +1300,8 @@ _unitTest = runTestTT tests
 
 tests :: Test
 tests = test
-  [ test_signalFromList
-  , test_signalToEvent
+  [ test_behaviorFromList
+  , test_behaviorToEvent
   , test_scanD
   , test_changesD
   , test_delayD
@@ -1314,18 +1314,18 @@ tests = test
   , test_apDiscrete1
   , test_eventFromList
   , test_preservesD
-  , test_joinS
-  , test_delayS
+  , test_joinB
+  , test_delayB
   , test_generatorE
   , test_generatorE1
   , test_accumE
-  , test_fmapSignal
-  , test_applySE
+  , test_fmapBehavior
+  , test_applyBE
   , test_joinDD
   , test_joinDE
-  , test_joinDS
+  , test_joinDB
   , test_mfix
-  , test_orderingViolation_joinDS
+  , test_orderingViolation_joinDB
   , test_externalEvent
   , test_externalE
   , test_mapAccumE
@@ -1338,50 +1338,50 @@ _skipped =
   [ test_takeWhileE -- broken when compiled. why???
   ]
 
-test_signalFromList = do
-  r <- networkToList 4 $ signalFromList ["foo", "bar", "baz", "quux", "xyzzy"]
+test_behaviorFromList = do
+  r <- networkToList 4 $ behaviorFromList ["foo", "bar", "baz", "quux", "xyzzy"]
   r @?= ["foo", "bar", "baz", "quux"]
 
-test_signalToEvent = do
+test_behaviorToEvent = do
   r <- networkToList 3 $ do
-    s0 <- signalFromList ["foo", "", "baz"]
-    return $ eventToSignal $ signalToEvent s0
+    s0 <- behaviorFromList ["foo", "", "baz"]
+    return $ eventToBehavior $ behaviorToEvent s0
   r @?= ["foo", "", "baz"]
 
 test_scanD = do
   r <- networkToList 3 $ do
-    strS <- signalFromList ["foo", "", "baz"]
-    accD <- scanD "<>" $ append <$> signalToEvent strS
-    return $ discreteToSignal accD
+    strB <- behaviorFromList ["foo", "", "baz"]
+    accD <- scanD "<>" $ append <$> behaviorToEvent strB
+    return $ discreteToBehavior accD
   r @?= ["<>/'f'/'o'/'o'", "<>/'f'/'o'/'o'", "<>/'f'/'o'/'o'/'b'/'a'/'z'"]
   where
     append ch str = str ++ "/" ++ show ch
 
 test_changesD = do
   r <- networkToList 3 $ do
-    strS <- signalFromList ["foo", "", "baz"]
-    accD <- scanD "<>" $ append <$> signalToEvent strS
-    return $ eventToSignal $ changesD accD
+    strB <- behaviorFromList ["foo", "", "baz"]
+    accD <- scanD "<>" $ append <$> behaviorToEvent strB
+    return $ eventToBehavior $ changesD accD
   r @?= [["<>/'f'/'o'/'o'"], [], ["<>/'f'/'o'/'o'/'b'/'a'/'z'"]]
   where
     append ch str = str ++ "/" ++ show ch
 
 test_delayD = do
   r <- networkToList 5 $ do
-    nS <- signalFromList (map pure $ iterate (+1) 0)
-    nD <- scanD (0 :: Int) (const <$> signalToEvent nS)
+    nS <- behaviorFromList (map pure $ iterate (+1) 0)
+    nD <- scanD (0 :: Int) (const <$> behaviorToEvent nS)
     nD' <- delayD (-1) nD
     nE <- preservesD ((,) <$> nD <*> nD')
-    return $ eventToSignal nE
+    return $ eventToBehavior nE
   r @?= map pure [(0, -1), (1, 0), (2, 1), (3, 2), (4, 3)]
 
 test_mappendEvent = do
   r <- networkToListGC 3 $ do
-    strS <- signalFromList ["foo", "", "baz"]
-    accD <- scanD "<>" $ append <$> signalToEvent strS
+    strB <- behaviorFromList ["foo", "", "baz"]
+    accD <- scanD "<>" $ append <$> behaviorToEvent strB
     ch <- preservesD accD
-    return $ eventToSignal $
-      ch `mappend` (signalToEvent $ (:[]) <$> strS)
+    return $ eventToBehavior $
+      ch `mappend` (behaviorToEvent $ (:[]) <$> strB)
   r @?= [["<>/'f'/'o'/'o'", "foo"], [""], ["<>/'f'/'o'/'o'/'b'/'a'/'z'", "baz"]]
   where
     append ch str = str ++ "/" ++ show ch
@@ -1389,9 +1389,9 @@ test_mappendEvent = do
 test_fmapEvent = do
   succCountRef <- newRef (0::Int)
   r <- networkToListGC 3 $ do
-    strS <- signalFromList ["foo", "", "baz"]
-    let lenE = mysucc succCountRef <$> signalToEvent strS
-    return $ eventToSignal $ lenE `mappend` lenE
+    strB <- behaviorFromList ["foo", "", "baz"]
+    let lenE = mysucc succCountRef <$> behaviorToEvent strB
+    return $ eventToBehavior $ lenE `mappend` lenE
   r @?= ["gppgpp", "", "cb{cb{"]
   count <- readRef succCountRef
   count @?= 6
@@ -1403,31 +1403,31 @@ test_fmapEvent = do
 
 test_filterE = do
   r <- networkToListGC 4 $ do
-    strS <- signalFromList ["FOo", "", "nom", "bAz"]
-    let lenE = filterE Char.isUpper $ signalToEvent strS
-    return $ eventToSignal $ lenE `mappend` lenE
+    strB <- behaviorFromList ["FOo", "", "nom", "bAz"]
+    let lenE = filterE Char.isUpper $ behaviorToEvent strB
+    return $ eventToBehavior $ lenE `mappend` lenE
   r @?= ["FOFO", "", "", "AA"]
 
 test_dropStepE = do
   r <- networkToListGC 3 $ do
-    strS <- signalFromList ["foo", "", "baz"]
-    lenE <- dropStepE $ signalToEvent strS
-    return $ eventToSignal $ lenE `mappend` lenE
+    strB <- behaviorFromList ["foo", "", "baz"]
+    lenE <- dropStepE $ behaviorToEvent strB
+    return $ eventToBehavior $ lenE `mappend` lenE
   r @?= ["", "", "bazbaz"]
 
 test_dropStepE1 = do
   r <- networkToListGC 3 $
-    eventToSignal <$> dropStepE stepClockE
+    eventToBehavior <$> dropStepE stepClockE
   r @?= [[], [()], [()]]
 
 test_apDiscrete = do
   r <- networkToListGC 4 $ do
-    ev0 <- signalToEvent <$> signalFromList [[], [], [1::Int], [2,3]]
-    ev1 <- signalToEvent <$> signalFromList [[], [4], [], [5]]
+    ev0 <- behaviorToEvent <$> behaviorFromList [[], [], [1::Int], [2,3]]
+    ev1 <- behaviorToEvent <$> behaviorFromList [[], [4], [], [5]]
     dis0 <- scanD 0 $ max <$> ev0
     dis1 <- scanD 0 $ max <$> ev1
     let dis = (*) <$> dis0 <*> dis1
-    eventToSignal <$> preservesD dis
+    eventToBehavior <$> preservesD dis
   r @?= [[0], [0], [4], [15]]
 
 test_apDiscrete1 = do
@@ -1437,13 +1437,13 @@ test_apDiscrete1 = do
     dis0 <- scanD 1 $ const <$> ev0
     dis1 <- scanD 1 $ const <$> ev1
     let dis = (*) <$> dis0 <*> dis1
-    return $ discreteToSignal dis
+    return $ discreteToBehavior dis
   r @?= [-1, 7, 14, 44]
 
 test_eventFromList = do
   r <- networkToListGC 3 $ do
     ev <- eventFromList [[2::Int], [], [3,4]]
-    return $ eventToSignal ev
+    return $ eventToBehavior ev
   r @?= [[2], [], [3,4]]
 
 test_preservesD = do
@@ -1451,36 +1451,36 @@ test_preservesD = do
     ev <- eventFromList [[], [], [3,4::Int]]
     dis <- scanD 0 (const <$> ev)
     ev1 <- preservesD dis
-    return $ eventToSignal ev1
+    return $ eventToBehavior ev1
   r @?= [[0], [], [4]]
 
-test_joinS = do
+test_joinB = do
   r <- networkToListGC 4 $ do
-    sig0 <- signalFromList [1, 2, 3, 4::Int]
-    sig1 <- signalFromList [11, 12, 13, 14]
-    sig2 <- signalFromList [21, 22, 23, 24]
-    sig3 <- signalFromList [31, 32, 33, 34]
-    sigSig <- signalFromList [sig0, sig3, sig2, sig1]
-    joinS sigSig
+    beh0 <- behaviorFromList [1, 2, 3, 4::Int]
+    beh1 <- behaviorFromList [11, 12, 13, 14]
+    beh2 <- behaviorFromList [21, 22, 23, 24]
+    beh3 <- behaviorFromList [31, 32, 33, 34]
+    behBeh <- behaviorFromList [beh0, beh3, beh2, beh1]
+    joinB behBeh
   r @?= [1, 32, 23, 14]
 
-test_delayS = do
+test_delayB = do
   r <- networkToListGC 4 $ do
-    sig <- signalFromList [1, 2, 3, 4::Int]
-    delayS (-1) sig
+    beh <- behaviorFromList [1, 2, 3, 4::Int]
+    delayB (-1) beh
   r @?= [-1, 1, 2, 3]
 
 test_generatorE = do
   r <- networkToListGC 4 $ do
-    evSig <- generatorE =<< eventFromList [[subnet0], [subnet1], [subnet2], [subnet3]]
-    let sigSig = head <$> eventToSignal evSig
-    joinS sigSig
+    evBeh <- generatorE =<< eventFromList [[subnet0], [subnet1], [subnet2], [subnet3]]
+    let behBeh = head <$> eventToBehavior evBeh
+    joinB behBeh
   r @?= [1, 11, 21, 31]
   where
-    subnet0 = signalFromList [1, 2, 3, 4::Int]
-    subnet1 = signalFromList [11, 12, 13, 14]
-    subnet2 = signalFromList [21, 22, 23, 24]
-    subnet3 = signalFromList [31, 32, 33, 34]
+    subnet0 = behaviorFromList [1, 2, 3, 4::Int]
+    subnet1 = behaviorFromList [11, 12, 13, 14]
+    subnet2 = behaviorFromList [21, 22, 23, 24]
+    subnet3 = behaviorFromList [31, 32, 33, 34]
 
 test_generatorE1 = do
   r <- networkToListGC 4 $ do
@@ -1488,24 +1488,24 @@ test_generatorE1 = do
       eventFromList [[subnet 0], [subnet 1, subnet 2], [], [subnet 3]]
     dEv <- scanD mempty $ const <$> evEv
     ev <- joinDE dEv
-    return $ eventToSignal ev
+    return $ eventToBehavior ev
   r @?= [[1], [21], [22, 23], [31]]
   where
     subnet k = fmap (10*k+) <$> eventFromList [[1], [2,3], [], [4::Int]]
 
 test_accumE = do
   r <- networkToList 3 $ do
-    strS <- signalFromList ["foo", "", "baz"]
-    accE <- scanE "<>" $ append <$> signalToEvent strS
-    return $ eventToSignal accE
+    strB <- behaviorFromList ["foo", "", "baz"]
+    accE <- scanE "<>" $ append <$> behaviorToEvent strB
+    return $ eventToBehavior accE
   r @?= [["<>f", "<>fo", "<>foo"], [], ["<>foob", "<>fooba", "<>foobaz"]]
   where
     append ch str = str ++ [ch]
 
-test_fmapSignal = do
+test_fmapBehavior = do
   succCountRef <- newRef (0::Int)
   r <- networkToListGC 3 $ do
-    chS <- signalFromList ['f', 'a', 'r']
+    chS <- behaviorFromList ['f', 'a', 'r']
     let fchS = mysucc succCountRef <$> chS
     return $ comb <$> fchS <*> (mysucc succCountRef <$> fchS)
   r @?= ["gh", "bc", "st"]
@@ -1518,11 +1518,11 @@ test_fmapSignal = do
       return $ succ c
     comb x y = [x, y]
 
-test_applySE = do
+test_applyBE = do
   r <- networkToListGC 3 $ do
     evt <- eventFromList ["ab", "", "c"]
-    sig <- signalFromList [0, 1, 2::Int]
-    return $ eventToSignal $ (,) <$> sig <@> evt
+    beh <- behaviorFromList [0, 1, 2::Int]
+    return $ eventToBehavior $ (,) <$> beh <@> evt
   r @?= [[(0, 'a'), (0, 'b')], [], [(2, 'c')]]
 
 test_joinDD = do
@@ -1535,7 +1535,7 @@ test_joinDD = do
       inner0 <- discrete "0a" [[], ["0b"], [], ["0c"], ["0d"]]
       inner1 <- discrete "1a" [[], ["1b"], [], ["1c"], ["1d"]]
       outer <- discrete inner0 [[], [inner1], [], [], [inner0]]
-      discreteToSignal <$> joinDD outer
+      discreteToBehavior <$> joinDD outer
 
     discrete initial list = do
       evt <- eventFromList list
@@ -1551,23 +1551,23 @@ test_joinDE = do
       inner0 <- eventFromList [[], ["0b"], [], ["0c"], ["0d"]]
       inner1 <- eventFromList [[], ["1b"], [], ["1c"], ["1d"]]
       outer <- discrete inner0 [[], [inner1], [], [], [inner0]]
-      eventToSignal <$> joinDE outer
+      eventToBehavior <$> joinDE outer
 
     discrete initial list = do
       evt <- eventFromList list
       scanD initial $ const <$> evt
 
-test_joinDS = do
+test_joinDB = do
   r <- networkToList 4 net
   r1 <- networkToListGC 4 net
   r @?= ["0a", "1b", "1c", "0d"]
   r1 @?= r
   where
     net = do
-      inner0 <- signalFromList ["0a", "0b", "0c", "0d"]
-      inner1 <- signalFromList ["1a", "1b", "1c", "1d"]
+      inner0 <- behaviorFromList ["0a", "0b", "0c", "0d"]
+      inner1 <- behaviorFromList ["1a", "1b", "1c", "1d"]
       outer <- discrete inner0 [[], [inner1], [], [inner0]]
-      joinDS outer
+      joinDB outer
 
     discrete initial list = do
       evt <- eventFromList list
@@ -1580,16 +1580,16 @@ test_mfix = do
     net = fmap snd $ mfix $ \ ~(e', _) -> do
       r <- scanD 1 $ (*) <$> e'
       e <- eventFromList [[], [2,3], [5::Int]]
-      return (e, discreteToSignal r)
+      return (e, discreteToBehavior r)
 
-test_orderingViolation_joinDS = do
+test_orderingViolation_joinDB = do
   g <- start net
   g >>= (@?=(0::Int))
   g >>= (@?=1)
   shouldThrowOrderingViolation g
   where
     net = fmap snd $ mfix $ \ ~(sd', _) -> do
-      s <- joinDS sd'
+      s <- joinDB sd'
       se <- eventFromList [[], [pure 1], [s]]
       sd <- scanD (pure 0) $ const <$> se
       return (sd, s)
@@ -1609,7 +1609,7 @@ test_externalEvent = do
 test_externalE = do
   ee <- newExternalEvent
   triggerExternalEvent ee "a"
-  g <- start $ eventToSignal <$> externalE ee
+  g <- start $ eventToBehavior <$> externalE ee
   triggerExternalEvent ee "b"
   g >>= (@?=["b"])
   g >>= (@?=[])
@@ -1625,11 +1625,11 @@ test_takeWhileE = do
   wA <- mkWeakWithIORef inputRefA inputRefA (Just $ add "A")
   wB <- mkWeakWithIORef inputRefB inputRefB (Just $ add "B")
   g <- start $ do
-    sigA <- externalS $ readRef inputRefA
-    sigB <- externalS $ readRef inputRefB
-    evtA <- takeWhileE (>0) $ signalToEvent sigA
-    evtB <- takeWhileE (>0) $ signalToEvent sigB
-    return $ (,) <$> eventToSignal evtA <*> eventToSignal evtB
+    behA <- externalB $ readRef inputRefA
+    behB <- externalB $ readRef inputRefB
+    evtA <- takeWhileE (>0) $ behaviorToEvent behA
+    evtB <- takeWhileE (>0) $ behaviorToEvent behB
+    return $ (,) <$> eventToBehavior evtA <*> eventToBehavior evtB
 
   performGC
   readRef finalizerRecord >>= (@?=[])
@@ -1667,7 +1667,7 @@ test_takeWhileE = do
 
 mkAccumCount n ac f = networkToList n $ do
   evt <- eventFromList $ map pure $ repeat 1
-  eventToSignal <$> ac 0 ((\i s -> f (i + s, i + s :: Int)) <$> evt)
+  eventToBehavior <$> ac 0 ((\i s -> f (i + s, i + s :: Int)) <$> evt)
 
 test_mapAccumE = do
   r <- mkAccumCount 10 mapAccumE id
@@ -1678,7 +1678,7 @@ test_mapAccumEM = do
     evt <- eventFromList $ map pure $ iterate (+1) 0
     eE <- mapAccumEM 0 ((\s n -> do e <- eventFromList (replicate n [] ++ [[n]]); return (n+s, e)) <$> evt)
     intE <- joinDE =<< scanD mempty (mappend <$> eE)
-    return $ eventToSignal intE
+    return $ eventToBehavior intE
   r @?= [[0],[0],[],[1],[],[],[3],[],[],[],[6],[],[],[],[],[10]]
 
 test_mapAccumEquivalent = do
@@ -1689,7 +1689,7 @@ test_mapAccumEquivalent = do
 test_delayE = do
   r <- networkToList 4 $ do
     evt <- eventFromList ["ab", "", "c", "d"]
-    eventToSignal <$> delayE evt
+    eventToBehavior <$> delayE evt
   r @?= ["", "ab", "", "c"]
 
 shouldThrowOrderingViolation :: IO a -> Assertion
