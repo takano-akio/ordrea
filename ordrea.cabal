@@ -2,7 +2,7 @@
 -- documentation, see http://haskell.org/cabal/users-guide/
 
 name:                ordrea
-version:             0.2.0.0
+version:             0.3.0.0
 synopsis:            Push-pull implementation of discrete-time FRP
 description:         This is an FRP library with the following characteristics:
                      .
