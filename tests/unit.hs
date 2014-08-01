@@ -18,3 +18,4 @@ main = do
       [ "-e", "_unitTest"
       , file
       ]
+    putChar '\n'
