@@ -28,7 +28,7 @@ cabal-version:       >=1.8
 library
   exposed-modules:     FRP.Ordrea
   other-modules:       FRP.Ordrea.Base, FRP.Ordrea.Weak, UnitTest
-  build-depends:       base >= 4.5 && < 5, transformers >= 0.3, containers >= 0.4, vector >= 0.9
+  build-depends:       base >= 4.5 && < 5, transformers >= 0.3, containers >= 0.4, vector >= 0.9, vector-space
   cpp-options:         -DNOTEST
 
 test-suite unit-tests

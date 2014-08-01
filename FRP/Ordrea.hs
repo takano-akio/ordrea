@@ -44,6 +44,10 @@ module FRP.Ordrea
   ) where
 
 import Control.Applicative
+import Data.AffineSpace (AffineSpace(..), (.-^))
+import Data.Foldable (foldl', toList)
+import Data.Sequence ((<|))
+import qualified Data.Sequence as Seq
 
 import FRP.Ordrea.Base
 import UnitTest
@@ -97,6 +101,26 @@ rightsE evt = mapMaybeE f evt
     f (Right x) = Just x
     f Left{} = Nothing
 
+delayForE
+  :: (AffineSpace time, Ord time)
+  => Diff time
+  -> Behavior time
+  -> Event a
+  -> SignalGen (Event a)
+delayForE duration nowB evt = do
+  expiredE <- mapAccumE Seq.empty $ updateBuffer
+    <$> eventToBehavior evt
+    <@> nowB <@ stepClockE
+  return $ flattenE $ map snd . toList <$> expiredE
+  where
+    updateBuffer occs now = validate now . addToBuffer occs now
+    addToBuffer occs now buffer =
+      foldl' (\buf val -> (now, val) <| buf) buffer occs
+    validate now buffer = (newBuffer, expired)
+      where
+        (expired, newBuffer) = Seq.spanr (isExpired . fst) buffer
+        isExpired time = time <= now .-^ duration
+
 ----------------------------------------------------------------------
 -- tests
 
@@ -105,6 +129,7 @@ _unitTest = runTestTT $ test
   , test_dropE
   , test_dropWhileE
   , test_takeE
+  , test_delayForE
   ]
 
 test_withPrevE = do
@@ -132,3 +157,10 @@ test_takeE = do
       =<< eventFromList [[1,2], [], [3,4 :: Int]]
     return $ eventToBehavior evt
   r @?= [[1,2], [], [3]]
+
+test_delayForE = do
+  r <- networkToList 5 $ do
+    timeB <- behaviorFromList [0..9 :: Double]
+    evt <- eventFromList $ map return [0..9 :: Int]
+    eventToBehavior <$> delayForE 2 timeB evt
+  r @?= [[], [], [0], [1], [2]]
