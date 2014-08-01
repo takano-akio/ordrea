@@ -78,7 +78,7 @@ takeE n evt = do
   evtWithCount <- mapAccumE n (countdown <$> evt)
   fmap snd <$> takeWhileE ((>0) . fst) evtWithCount
   where
-    countdown occ k = (k', (k', occ))
+    countdown occ k = (k', (k, occ))
       where
         !k' = k - 1
 
