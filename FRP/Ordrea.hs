@@ -121,6 +121,21 @@ delayForE duration nowB evt = do
         (expired, newBuffer) = Seq.spanr (isExpired . fst) buffer
         isExpired time = time <= now .-^ duration
 
+throttleE
+  :: (AffineSpace time, Ord time)
+  => Diff time
+  -> Behavior time
+  -> Event a
+  -> SignalGen (Event a)
+throttleE duration nowB evt = do
+  throttledE <- mapAccumE Nothing $ f <$> nowB <@> evt
+  return $ justE throttledE
+  where
+    f now val Nothing = (Just now, Just val)
+    f now val (Just prev)
+      | prev <= now .-^ duration = (Just now, Just val)
+      | otherwise = (Just prev, Nothing)
+
 ----------------------------------------------------------------------
 -- tests
 
@@ -130,6 +145,7 @@ _unitTest = runTestTT $ test
   , test_dropWhileE
   , test_takeE
   , test_delayForE
+  , test_throttleE
   ]
 
 test_withPrevE = do
@@ -164,3 +180,10 @@ test_delayForE = do
     evt <- eventFromList $ map return [0..9 :: Int]
     eventToBehavior <$> delayForE 2 timeB evt
   r @?= [[], [], [0], [1], [2]]
+
+test_throttleE = do
+  r <- networkToList 10 $ do
+    timeB <- behaviorFromList [0..9 :: Double]
+    evt <- eventFromList $ map return [0..9 :: Int]
+    eventToBehavior <$> throttleE 2.5 timeB evt
+  r @?= [[0], [], [], [3], [], [], [6], [], [], [9]]
