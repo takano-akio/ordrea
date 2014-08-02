@@ -18,6 +18,7 @@ module FRP.Ordrea
   , takeWhileE, delayE
   , withPrevE, dropE, dropWhileE, takeE
   , partitionEithersE, leftsE, rightsE
+  , delayForE, throttleE, debounceE
 
   -- * Switchers
   , joinDD, joinDE, joinDB
