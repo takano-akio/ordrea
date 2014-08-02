@@ -46,6 +46,7 @@ module FRP.Ordrea
 import Control.Applicative
 import Data.AffineSpace (AffineSpace(..), (.-^))
 import Data.Foldable (foldl', toList)
+import Data.Monoid (Last(..), (<>))
 import Data.Sequence ((<|))
 import qualified Data.Sequence as Seq
 
@@ -136,6 +137,34 @@ throttleE duration nowB evt = do
       | prev <= now .-^ duration = (Just now, Just val)
       | otherwise = (Just prev, Nothing)
 
+debounceE
+  :: (AffineSpace time, Ord time)
+  => Diff time
+  -> Behavior time
+  -> Event a
+  -> SignalGen (Event a)
+debounceE duration nowB evt = do
+  delayedE <- delayForE duration nowB evt
+  let
+    enqueueE = enqueue <$> evt
+    dequeueE = dequeue <$ delayedE
+  queueD <- scanD (Last Nothing, 0 :: Int) $ enqueueE <> dequeueE
+  let emitE = triggerWhen $ (== 0) . snd <$> queueD
+  return $ justE $ getLast . fst <$> queueD <@ emitE
+  where
+    enqueue val (lastVal, n) = (lastVal', n')
+      where
+        !lastVal' = lastVal <> Last (Just val)
+        !n' = n + 1
+    dequeue (lastVal, n)
+      | n > 0 = n' `seq` (lastVal, n')
+      | otherwise = (lastVal, n)
+      where
+        n' = n - 1
+    triggerWhen dis = justE $ f <$> changesD dis
+      where
+        f b = if b then Just () else Nothing
+
 ----------------------------------------------------------------------
 -- tests
 
@@ -146,6 +175,7 @@ _unitTest = runTestTT $ test
   , test_takeE
   , test_delayForE
   , test_throttleE
+  , test_debounceE
   ]
 
 test_withPrevE = do
@@ -187,3 +217,10 @@ test_throttleE = do
     evt <- eventFromList $ map return [0..9 :: Int]
     eventToBehavior <$> throttleE 2.5 timeB evt
   r @?= [[0], [], [], [3], [], [], [6], [], [], [9]]
+
+test_debounceE = do
+  r <- networkToList 10 $ do
+    timeB <- behaviorFromList [0..9 :: Double]
+    evt <- eventFromList [[0 :: Int], [], [], [1], [2], [3], [], [], [], []]
+    eventToBehavior <$> debounceE 1.5 timeB evt
+  r @?= [[], [], [0], [], [], [], [], [3], [], []]
