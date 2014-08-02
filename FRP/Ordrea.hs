@@ -102,10 +102,13 @@ rightsE evt = mapMaybeE f evt
     f (Right x) = Just x
     f Left{} = Nothing
 
+-- | Delay the event for the given period.
 delayForE
   :: (AffineSpace time, Ord time)
   => Diff time
+  -- ^ Delay period
   -> Behavior time
+  -- ^ Current time
   -> Event a
   -> SignalGen (Event a)
 delayForE duration nowB evt = do
@@ -122,10 +125,15 @@ delayForE duration nowB evt = do
         (expired, newBuffer) = Seq.spanr (isExpired . fst) buffer
         isExpired time = time <= now .-^ duration
 
+-- | Ensure that the event is never triggered more frequently than the
+-- specified period. If there are some subsequent occurrences in the
+-- period, they are just ignored.
 throttleE
   :: (AffineSpace time, Ord time)
   => Diff time
+  -- ^ Throttling period
   -> Behavior time
+  -- ^ Current time
   -> Event a
   -> SignalGen (Event a)
 throttleE duration nowB evt = do
@@ -137,10 +145,16 @@ throttleE duration nowB evt = do
       | prev <= now .-^ duration = (Just now, Just val)
       | otherwise = (Just prev, Nothing)
 
+-- | Delay the event until the debounce period has elapsed with no subsequent
+-- events are triggered. If any events are triggered before the specified time
+-- has elapsed, the timer is reset and entire period must pass again.
+-- Otherwise, the last triggered event will be returned.
 debounceE
   :: (AffineSpace time, Ord time)
   => Diff time
+  -- ^ Debouncing period
   -> Behavior time
+  -- ^ Current time
   -> Event a
   -> SignalGen (Event a)
 debounceE duration nowB evt = do
