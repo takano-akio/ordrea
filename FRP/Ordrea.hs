@@ -48,7 +48,7 @@ import Control.Applicative
 import Data.AffineSpace (AffineSpace(..), (.-^))
 import Data.Foldable (foldl', toList)
 import Data.Monoid (Last(..), (<>))
-import Data.Sequence ((<|))
+import Data.Sequence ((|>))
 import qualified Data.Sequence as Seq
 
 import FRP.Ordrea.Base
@@ -120,10 +120,10 @@ delayForE duration nowB evt = do
   where
     updateBuffer occs now = validate now . addToBuffer occs now
     addToBuffer occs now buffer =
-      foldl' (\buf val -> (now, val) <| buf) buffer occs
+      foldl' (\buf val -> buf |> (now, val)) buffer occs
     validate now buffer = (newBuffer, expired)
       where
-        (expired, newBuffer) = Seq.spanr (isExpired . fst) buffer
+        (expired, newBuffer) = Seq.spanl (isExpired . fst) buffer
         isExpired time = time <= now .-^ duration
 
 -- | Ensure that the event is never triggered more frequently than the
@@ -222,9 +222,9 @@ test_takeE = do
 test_delayForE = do
   r <- networkToList 5 $ do
     timeB <- behaviorFromList [0..9 :: Double]
-    evt <- eventFromList $ map return [0..9 :: Int]
+    evt <- eventFromList $ map (\x -> [x, x+1]) [0..9 :: Int]
     eventToBehavior <$> delayForE 2 timeB evt
-  r @?= [[], [], [0], [1], [2]]
+  r @?= [[], [], [0,1], [1,2], [2,3]]
 
 test_throttleE = do
   r <- networkToList 10 $ do
