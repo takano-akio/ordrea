@@ -24,12 +24,13 @@ module FRP.Ordrea
   , joinDD, joinDE, joinDB
 
   -- * Behaviors
-  , start, externalB, joinB, delayB, behaviorFromList, networkToList
+  , start, externalB, joinB, delayB, generatorB
+  , behaviorFromList, networkToList
   , networkToListGC
 
   -- * Discretes
   , scanD, changesD, preservesD, delayD
-  , stepperD
+  , stepperD, generatorD
 
   -- * Behavior-event functions
   , eventToBehavior, behaviorToEvent, applyBE
@@ -47,7 +48,7 @@ module FRP.Ordrea
 import Control.Applicative
 import Data.AffineSpace (AffineSpace(..), (.-^))
 import Data.Foldable (foldl', toList)
-import Data.Monoid (Last(..), (<>))
+import Data.Monoid (Last(..), (<>), mempty)
 import Data.Sequence ((|>))
 import qualified Data.Sequence as Seq
 
@@ -55,6 +56,19 @@ import FRP.Ordrea.Base
 import UnitTest
 
 -- Derived functions
+
+generatorB :: Behavior (SignalGen a) -> SignalGen (Behavior a)
+generatorB beh = do
+  ev <- generatorE (beh <@ stepClockE)
+  dis <- stepperD err ev
+  return $ discreteToBehavior dis
+  where
+    err = error "FRP.Ordrea.generatorB: bug: prehistoric element"
+
+generatorD :: Discrete (SignalGen a) -> SignalGen (Discrete a)
+generatorD dis = preservesD dis >>= generatorE >>= stepperD err
+  where
+    err = error "FRP.Ordrea.generatorD: bug: prehistoric element"
 
 stepperD :: a -> Event a -> SignalGen (Discrete a)
 stepperD initial evt = scanD initial (const <$> evt)
@@ -184,7 +198,10 @@ debounceE duration nowB evt = do
 -- tests
 
 _unitTest = runTestTT $ test
-  [ test_withPrevE
+  [ test_generatorD
+  , test_generatorD1
+  , test_generatorB
+  , test_withPrevE
   , test_dropE
   , test_dropWhileE
   , test_takeE
@@ -192,6 +209,41 @@ _unitTest = runTestTT $ test
   , test_throttleE
   , test_debounceE
   ]
+
+test_generatorD = do
+  r <- networkToListGC 4 $ do
+    ev <- eventFromList [[subnet0], [subnet1], [subnet2], [subnet3]]
+    dis <- stepperD (return (pure 0)) ev
+    disBeh <- generatorD dis
+    joinDB disBeh
+  r @?= [1, 11, 21, 31]
+  where
+    subnet0 = behaviorFromList [1, 2, 3, 4::Int]
+    subnet1 = behaviorFromList [11, 12, 13, 14]
+    subnet2 = behaviorFromList [21, 22, 23, 24]
+    subnet3 = behaviorFromList [31, 32, 33, 34]
+
+test_generatorD1 = do
+  r <- networkToListGC 4 $ do
+    ev <- eventFromList [[subnet 0], [subnet 1, subnet 2], [], [subnet 3]]
+    dEv <- generatorD =<< stepperD (return mempty) ev
+    ev' <- joinDE dEv
+    return $ eventToBehavior ev'
+  r @?= [[1], [21], [22, 23], [31]]
+  where
+    subnet k = fmap (10*k+) <$> eventFromList [[1], [2,3], [], [4::Int]]
+
+test_generatorB = do
+  r <- networkToListGC 4 $ do
+    beh <- behaviorFromList [subnet0, subnet1, subnet2, subnet3]
+    behBeh <- generatorB beh
+    joinB behBeh
+  r @?= [1, 11, 21, 31]
+  where
+    subnet0 = behaviorFromList [1, 2, 3, 4::Int]
+    subnet1 = behaviorFromList [11, 12, 13, 14]
+    subnet2 = behaviorFromList [21, 22, 23, 24]
+    subnet3 = behaviorFromList [31, 32, 33, 34]
 
 test_withPrevE = do
   r <- networkToList 3 $ do
