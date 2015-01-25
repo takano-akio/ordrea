@@ -1,4 +1,5 @@
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE TupleSections #-}
 {-# OPTIONS_GHC -Wall -fno-warn-missing-signatures #-}
 module FRP.Ordrea
   (
@@ -19,6 +20,7 @@ module FRP.Ordrea
   , withPrevE, dropE, dropWhileE, takeE
   , partitionEithersE, leftsE, rightsE
   , delayForE, throttleE, debounceE
+  , groupByE, groupWithInitialByE, groupE, groupWithInitialE
 
   -- * Switchers
   , joinDD, joinDE, joinDB
@@ -48,7 +50,8 @@ module FRP.Ordrea
 import Control.Applicative
 import Data.AffineSpace (AffineSpace(..), (.-^))
 import Data.Foldable (foldl', toList)
-import Data.Monoid (Last(..), (<>), mempty)
+import Data.Function
+import Data.Monoid
 import Data.Sequence ((|>))
 import qualified Data.Sequence as Seq
 
@@ -194,6 +197,34 @@ debounceE duration nowB evt = do
       where
         f b = if b then Just () else Nothing
 
+-- | @groupByE eqv evt@ creates a stream of event streams, each corresponding
+-- to a span of consecutive occurrences of equivalent elements in the original
+-- stream. Equivalence is tested using @eqv@.
+groupByE :: (a -> a -> Bool) -> Event a -> SignalGen (Event (Event a))
+groupByE eqv sourceEvt = fmap snd <$> groupWithInitialByE eqv sourceEvt
+
+-- | @groupWithInitialByE eqv evt@ creates a stream of event streams, each corresponding
+-- to a span of consecutive occurrences of equivalent elements in the original
+-- stream. Equivalence is tested using @eqv@. In addition, each outer event
+-- occurrence contains the first occurrence of its inner event.
+groupWithInitialByE :: (a -> a -> Bool) -> Event a -> SignalGen (Event (a, Event a))
+groupWithInitialByE eqv sourceEvt = do
+    networkE <- justE <$> mapAccumE Nothing (makeNetwork <$> sourceEvt)
+    generatorE networkE
+    where
+        makeNetwork val currentVal
+            | maybe False (eqv val) currentVal = (currentVal, Nothing)
+            | otherwise = (Just val, Just $ (,) val <$> network val)
+        network val = takeWhileE (eqv val) =<< dropWhileE (not . eqv val) sourceEvt
+
+-- | Same as @'groupByE' (==)@
+groupE :: (Eq a) => Event a -> SignalGen (Event (Event a))
+groupE = groupByE (==)
+
+-- | Same as @groupWithInitialByE (==)@
+groupWithInitialE :: (Eq a) => Event a -> SignalGen (Event (a, Event a))
+groupWithInitialE = groupWithInitialByE (==)
+
 ----------------------------------------------------------------------
 -- tests
 
@@ -208,6 +239,8 @@ _unitTest = runTestThrow $ test
   , test_delayForE
   , test_throttleE
   , test_debounceE
+  , test_groupWithInitialByE
+  , test_groupByE
   ]
 
 test_generatorD = do
@@ -291,3 +324,21 @@ test_debounceE = do
     evt <- eventFromList [[0 :: Int], [], [], [1], [2], [3], [], [], [], []]
     eventToBehavior <$> debounceE 1.5 timeB evt
   r @?= [[], [], [0], [], [], [], [], [3], [], []]
+
+test_groupWithInitialByE = do
+  r <- networkToList 4 $ do
+    evt <- eventFromList [[1,5,6], [2], [], [3,4 :: Int]]
+    grps <- groupWithInitialByE ((==) `on` (`mod` 4)) evt
+    return $ eventToBehavior $ fst <$> grps
+  r @?= [[1, 6], [], [], [3, 4]]
+
+test_groupByE = do
+  r <- networkToList 4 $ do
+    evt <- eventFromList [[1,5,6], [2], [], [3,4 :: Int]]
+    grps <- groupByE ((==) `on` (`mod` 4)) evt
+    col <- stepperD [] . fmap snd =<< scanE (0::Int, []) (upd <$> grps)
+    merged <- joinDE $ mconcat <$> col
+    return $ eventToBehavior merged
+  r @?= [[(0, 1), (0, 5), (1, 6)], [(1, 2)], [], [(2, 3), (3, 4)]]
+  where
+    upd grp (gid, grps) = (gid + 1, grps ++ [((gid,) <$> grp)])
