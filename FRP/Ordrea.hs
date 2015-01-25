@@ -197,7 +197,7 @@ debounceE duration nowB evt = do
 ----------------------------------------------------------------------
 -- tests
 
-_unitTest = runTestTT $ test
+_unitTest = runTestThrow $ test
   [ test_generatorD
   , test_generatorD1
   , test_generatorB

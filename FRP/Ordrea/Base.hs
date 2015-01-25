@@ -1295,8 +1295,8 @@ debugTraceEnabled = False
 ----------------------------------------------------------------------
 -- tests
 
-_unitTest :: IO Counts
-_unitTest = runTestTT tests
+_unitTest :: IO ()
+_unitTest = runTestThrow tests
 
 tests :: Test
 tests = test

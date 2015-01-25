@@ -2,7 +2,7 @@
 
 module UnitTest
   ( (@?=)
-  , runTestTT
+  , runTestThrow
   , Counts
   , Test
   , Assertion
@@ -13,8 +13,8 @@ module UnitTest
 
 (@?=) :: a -> a -> IO ()
 (@?=) = undefined
-runTestTT :: a
-runTestTT = undefined
+runTestThrow :: a
+runTestThrow = undefined
 type Counts = ()
 type Test = ()
 type Assertion = IO ()
@@ -23,7 +23,14 @@ test = undefined
 
 #else
 
+import Control.Monad
 import Test.HUnit
+
+runTestThrow :: Test -> IO ()
+runTestThrow t = do
+  counts <- runTestTT t
+  when (errors counts /= 0 || failures counts /= 0) $
+    fail "test failure"
 
 #endif
 
