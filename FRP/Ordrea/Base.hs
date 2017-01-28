@@ -23,7 +23,7 @@ module FRP.Ordrea.Base
   , joinDD, joinDE, joinDB
 
   , start, externalB, joinB, delayB, behaviorFromList, networkToList
-  , networkToListGC
+  , networkToListGC, snapshotB
 
   , scanD, changesD, preservesD, delayD
 
@@ -217,9 +217,8 @@ deRefWeakLike (WeakLike a) = a
 
 data GEnv = GEnv
   { envRegisterInit :: Consumer (Initialize ())
-  , envGRegisterPrep :: Consumer (Run ())
   , envGenLocation :: IO Location
-  , envGCurrentStep :: Maybe REnv
+  , envIEnv :: IEnv
   }
 
 -- Note [Global preparation accumulator]
@@ -237,21 +236,26 @@ runSignalGen
   :: Consumer (Run ()) -- ^ see Note [Global preparation accumulator]
   -> Location -- ^ the location of the parent node of this subnetwork
   -> Push -- ^ the global clock notifier
-  -> Maybe REnv -- ^ the Run env if we are in an execution step
+  -> REnv -- ^ the Run env if we are in an execution step
   -> SignalGen a -- ^ an action to create a (sub)network
   -> IO a
 runSignalGen regPrep parentLoc clock curStep (SignalGen gen) = do
   (registerI, runAccumI) <- newActionAccum
   locGen <- newLocationGen parentLoc
   let
+    ienv = IEnv
+      { envClock = clock
+      , envParentLocation = parentLoc
+      , envRegisterPrep = regPrep
+      , envCurrentStep = curStep
+      }
     genv = GEnv
       { envRegisterInit = registerI
-      , envGRegisterPrep = regPrep
       , envGenLocation = locGen
-      , envGCurrentStep = curStep
+      , envIEnv = ienv
       }
   result <- runReaderT gen genv
-  runInit parentLoc clock curStep regPrep runAccumI
+  runInit ienv runAccumI
   return result
 
 -- | Run SignalGen in the Run monad, as part of an execution step.
@@ -260,22 +264,25 @@ runSignalGenInStep = do
   regPrep <- getPreparationAdder
   return $ \parentLoc clock sgen -> debugFrame "SGenInStep" $ do
     renv <- ask
-    liftIO $ runSignalGen regPrep parentLoc clock (Just renv) sgen
+    liftIO $ runSignalGen regPrep parentLoc clock renv sgen
 
 -- | Run a SignalGen action that constructs an independent network.
 -- Returns a pair of the result and an "preparation" action to be performed
 -- before each step.
-runSignalGenToplevel :: SignalGen (Initialize a) -> IO (a, Run ())
+runSignalGenToplevel :: SignalGen (Initialize a) -> Run (a, Run ())
 runSignalGenToplevel gen = do
-  (clock, clockTrigger) <- newPush
-  prepVar <- newMVar (prepClock clockTrigger)
-  val <- debugFrame "toplevel" $ do
-    ref <- newRef undefined
-    runSignalGen (addToPrep prepVar) bottomLocation clock Nothing $ do
-      i <- gen
-      registerInit $ writeRef ref =<< i
-    readRef ref
-  return (val, join $ liftIO $ swapMVar prepVar (prepClock clockTrigger))
+  renv <- ask
+  (clock, clockTrigger) <- liftIO newPush
+  prepClock clockTrigger
+  liftIO $ do
+    prepVar <- newMVar (prepClock clockTrigger)
+    val <- debugFrame "toplevel" $ do
+      ref <- newRef undefined
+      runSignalGen (addToPrep prepVar) bottomLocation clock renv $ do
+        i <- gen
+        registerInit $ writeRef ref =<< i
+      readRef ref
+    return (val, join $ liftIO $ swapMVar prepVar (prepClock clockTrigger))
   where
     addToPrep prepVar x = modifyMVar_ prepVar (\r -> return (x >> r))
     prepClock clockTrigger = registerUpd (bottomPrio bottomLocation) clockTrigger
@@ -297,7 +304,11 @@ registerInit ini = SignalGen $ do
 -- | Get access to the global preparation accumulator. See Note [Global
 -- preparation accumulator].
 getPreparationAdder :: SignalGen (Run () -> IO ())
-getPreparationAdder = SignalGen $ asks envGRegisterPrep
+getPreparationAdder = SignalGen $ asks $ envRegisterPrep . envIEnv
+
+-- | Get the initialization environment to be used with this subnetwork.
+getIEnv :: SignalGen IEnv
+getIEnv = SignalGen $ asks envIEnv
 
 ----------------------------------------------------------------------
 -- Initialize monad
@@ -305,8 +316,8 @@ getPreparationAdder = SignalGen $ asks envGRegisterPrep
 data IEnv = IEnv
   { envClock :: Push
   , envParentLocation :: Location
-  , envIRegisterPrep :: Consumer (Run ())
-  , envICurrentStep :: Maybe REnv
+  , envRegisterPrep :: Consumer (Run ())
+  , envCurrentStep :: REnv
   }
 
 -- | Get the global clock.
@@ -317,47 +328,32 @@ _getParentLocation :: Initialize Location
 _getParentLocation = asks envParentLocation
 
 -- | Run Initialize
-runInit :: Location -> Push -> Maybe REnv -> Consumer (Run ()) -> Initialize a -> IO a
-runInit parentLoc clock curStep regPrep i = do
-  let
-    ienv = IEnv
-      { envClock = clock
-      , envIRegisterPrep = regPrep
-      , envParentLocation = parentLoc
-      , envICurrentStep = curStep
-      }
-  runReaderT i ienv
+runInit :: IEnv -> Initialize a -> IO a
+runInit ienv i = runReaderT i ienv
 
 -- | Creates a function that runs an @Initialize@ action inside @Run@,
 -- using @loc@ as the parent location.
 makeSubinitializer :: Location -> Initialize (Initialize a -> Run a)
 makeSubinitializer loc = do
-  clock <- getClock
-  regPrep <- asks envIRegisterPrep
+  parentIenv <- ask
   return $ \sub -> do
     renv <- ask
-    liftIO $ runInit loc clock (Just renv) regPrep sub
+    liftIO $ runInit parentIenv { envCurrentStep = renv } sub
 
 runInCurrentStep
-  :: Initialize a -- ^ action to perform if we're not inside a step
-  -> Run a -- ^ action to perform if we are inside a step
+  :: Run a -- ^ action to perform
   -> Initialize a
-runInCurrentStep no yes = do
-  curStep <- asks envICurrentStep
-  case curStep of
-    Nothing -> no
-    Just renv -> liftIO $ runReaderT yes renv
-
-runInStep :: Run () -> Initialize ()
-runInStep action = runInCurrentStep (registerNextStep action) action
+runInCurrentStep run = do
+  renv <- asks envCurrentStep
+  liftIO $ runReaderT run renv
 
 registerNextStep :: Run () -> Initialize ()
 registerNextStep x = do
-  addPrep <- asks envIRegisterPrep
+  addPrep <- asks envRegisterPrep
   liftIO $ addPrep x
 
 getPreparationAdderI :: Initialize (Run () -> IO ())
-getPreparationAdderI = asks envIRegisterPrep
+getPreparationAdderI = asks envRegisterPrep
 
 ----------------------------------------------------------------------
 -- Run monad
@@ -607,7 +603,7 @@ listenToPullPush
   -> Initialize ()
 listenToPullPush key pull notifier prio handler = do
   addPrep <- getPreparationAdderI
-  runInStep $ registerUpd prio $ do
+  runInCurrentStep $ registerUpd prio $ do
     handler =<< pull
     liftIO $ addPrep $
       listenToPush key notifier $ handler =<< pull
@@ -774,7 +770,7 @@ dropStepE ~(Evt evtprio evt) = Evt prio <$> do
   newNode $ do
     (result, trigger, key) <- newEventInit
     (getoccs, evtnotifier) <- evt
-    runInStep $ liftIO $ addPrep $ listenToPush key evtnotifier $ do
+    liftIO $ addPrep $ listenToPush key evtnotifier $ do
       occs <- getoccs
       when (not $ null occs) $ trigger occs
     return result
@@ -1053,14 +1049,21 @@ instance Applicative Behavior where
 
 start :: SignalGen (Behavior a) -> IO (IO a)
 start gensig = do
-  (getval, prep) <- runSignalGenToplevel $ do
-    Beh _ sig <- gensig
-    return $ sig
+  ref <- newRef Nothing
   return $ runRun $ debugFrame "step" $ do
-    debug "step"
-    prep
-    runUpdates
-    debugFrame "getval" getval
+    state <- readRef ref
+    case state of
+      Nothing -> do
+        (getval, prep) <- runSignalGenToplevel $ do
+          Beh _ sig <- gensig
+          return $ sig
+        writeRef ref $ Just $ do
+          debugFrame "prep" prep
+          runUpdates
+          debugFrame "getval" getval
+        runUpdates
+        debugFrame "getval" getval
+      Just go -> go
 
 externalB :: IO a -> SignalGen (Behavior a)
 externalB get = fmap (Beh (bottomPrio bottomLocation)) $
@@ -1085,7 +1088,7 @@ delayB initial ~(Beh sigprio sig) = do
   registerInit $ do
     clock <- getClock
     pull <- sig
-    registerNextStep $ listenToPush (WeakKey ref) clock $
+    listenToPush (WeakKey ref) clock $
       registerUpd (nextPrio sigprio) $ do
         debug "delayB: pull"
         newVal <- pull
@@ -1113,6 +1116,16 @@ networkToListGC count network = do
   smp <- start network
   replicateM count (performGC >> smp)
 
+snapshotB :: Behavior a -> SignalGen a
+snapshotB ~(Beh sigprio sig) = do
+  ienv <- getIEnv
+  loc <- genLocation
+  let prio = bottomPrio loc
+  liftIO $ runInit ienv $ do
+    prio `shouldBeGreaterThan` sigprio
+    pull <- sig
+    runInCurrentStep pull
+
 ----------------------------------------------------------------------
 -- events and discretes
 
@@ -1133,7 +1146,7 @@ changesD (Dis disprio dis) = Evt prio $ unsafeCache $ do
   (disPull, disPush) <- dis
   let upd = eventTrigger ref (return ()) . (:[]) =<< disPull
   listenToPush (WeakKey ref) disPush upd
-  runInCurrentStep (return ()) $ do
+  runInCurrentStep $ do
     -- If we are in a step, we need to set up the ref now.
     active <- pushHasBeenTriggered disPush
     when active upd
@@ -1332,6 +1345,7 @@ tests = test
   , test_mapAccumEM
   , test_mapAccumEquivalent
   , test_delayE
+  , test_snapshotB
   ]
 
 _skipped =
@@ -1611,11 +1625,13 @@ test_externalE = do
   triggerExternalEvent ee "a"
   g <- start $ eventToBehavior <$> externalE ee
   triggerExternalEvent ee "b"
-  g >>= (@?=["b"])
   g >>= (@?=[])
   triggerExternalEvent ee "c"
+  g >>= (@?=["c"])
+  g >>= (@?=[])
   triggerExternalEvent ee "d"
-  g >>= (@?=["c","d"])
+  triggerExternalEvent ee "e"
+  g >>= (@?=["d","e"])
 
 test_takeWhileE = do
   finalizerRecord <- newRef []
@@ -1691,6 +1707,26 @@ test_delayE = do
     evt <- eventFromList ["ab", "", "c", "d"]
     eventToBehavior <$> delayE evt
   r @?= ["", "ab", "", "c"]
+
+test_snapshotB = do
+  r <- networkToList 6 $ do
+    beh <- behaviorFromList [0::Int ..]
+    b0 <- snapshotB beh
+    ev <- eventFromList ["ab", "", "", "c", "", ""]
+    let
+      subnet ch = do
+        v <- snapshotB beh
+        if even v
+          then return $ pure ""
+          else do
+            numB <- behaviorFromList [0::Int ..]
+            return $ (show v++) . (ch:) . show <$> numB
+
+    bE <- generatorE $ subnet <$> ev
+    bD <- scanD (pure "") $ const <$> bE
+    b <- joinB $ discreteToBehavior bD
+    return $ (show b0++) <$> b
+  r @?= ["0", "0", "0", "03c0", "03c1", "03c2"]
 
 shouldThrowOrderingViolation :: IO a -> Assertion
 shouldThrowOrderingViolation x = do
