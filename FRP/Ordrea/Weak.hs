@@ -17,7 +17,7 @@ import GHC.STRef
 import GHC.Weak
 
 mkWeakWithIORef :: IORef a -> v -> Maybe (IO ()) -> IO (Weak v)
-mkWeakWithIORef (IORef (STRef ref)) v (Just fin) = IO $ \s ->
+mkWeakWithIORef (IORef (STRef ref)) v (Just (IO fin)) = IO $ \s ->
   case mkWeak# ref v fin s of
     (# s1, w #) -> (# s1, Weak w #)
 mkWeakWithIORef (IORef (STRef ref)) v Nothing = IO $ \s ->
