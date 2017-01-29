@@ -57,6 +57,7 @@ import Data.Word
 import System.IO.Unsafe
 import System.Mem (performGC)
 import System.Mem.Weak
+import Prelude
 
 import FRP.Ordrea.Weak
 import UnitTest
@@ -331,10 +332,9 @@ _getParentLocation = asks envParentLocation
 runInit :: IEnv -> Initialize a -> IO a
 runInit ienv i = runReaderT i ienv
 
--- | Creates a function that runs an @Initialize@ action inside @Run@,
--- using @loc@ as the parent location.
-makeSubinitializer :: Location -> Initialize (Initialize a -> Run a)
-makeSubinitializer loc = do
+-- | Creates a function that runs an @Initialize@ action inside @Run@.
+makeSubinitializer :: Initialize (Initialize a -> Run a)
+makeSubinitializer = do
   parentIenv <- ask
   return $ \sub -> do
     renv <- ask
@@ -346,11 +346,6 @@ runInCurrentStep
 runInCurrentStep run = do
   renv <- asks envCurrentStep
   liftIO $ runReaderT run renv
-
-registerNextStep :: Run () -> Initialize ()
-registerNextStep x = do
-  addPrep <- asks envRegisterPrep
-  liftIO $ addPrep x
 
 getPreparationAdderI :: Initialize (Run () -> IO ())
 getPreparationAdderI = asks envRegisterPrep
@@ -979,7 +974,7 @@ joinDD outer@ ~(Dis outerprio _) = do
   (push, trigger) <- liftIO newPush
   fmap (Dis prio) $ newNode $ do
     prio `shouldBeGreaterThan` outerprio
-    runSubinit <- makeSubinitializer here
+    runSubinit <- makeSubinitializer
     listenToDiscrete (WeakKey outerRef) outer prio $ \inner -> do
       debug $ "joinDD: outer"
       innerRef <- newRef $ error "joinDD: innerRef not initialized"
@@ -1001,7 +996,7 @@ joinDE outer@ ~(Dis outerprio _) = do
   (push, trigger) <- liftIO newPush
   fmap (Evt prio) $ newNode $ do
     prio `shouldBeGreaterThan` outerprio
-    runSubinit <- makeSubinitializer here
+    runSubinit <- makeSubinitializer
     listenToDiscrete (WeakKey outerRef) outer prio $ \inner -> do
       debug $ "joinDE: outer"
       innerRef <- newRef []
@@ -1023,7 +1018,7 @@ joinDB outer@ ~(Dis outerprio _) = do
   outerRef <- newRef $ error "joinDB: outerRef not initialized"
   fmap (Beh prio) $ newNode $ do
     prio `shouldBeGreaterThan` outerprio
-    runSubinit <- makeSubinitializer here
+    runSubinit <- makeSubinitializer
     listenToDiscrete (WeakKey outerRef) outer prio
         $ \(Beh innerprio sig) -> do
       debug $ "joinDB: outer"
@@ -1075,7 +1070,7 @@ joinB ~(Beh _sigsigprio sigsig) = do
   let prio = bottomPrio here
   fmap (Beh prio) $ newNode $ do
     debug $ "joinB: making pull; prio=" ++ show prio
-    runSubinit <- makeSubinitializer here
+    runSubinit <- makeSubinitializer
     sigpull <- sigsig
     primStepMemo $ do
       Beh _sigprio sig <- sigpull
