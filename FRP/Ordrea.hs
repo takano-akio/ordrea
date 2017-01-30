@@ -23,10 +23,10 @@ module FRP.Ordrea
   , groupByE, groupWithInitialByE, groupE, groupWithInitialE
 
   -- * Switchers
-  , joinDD, joinDE, joinDB
+  , joinDE, joinDB
 
   -- * Behaviors
-  , start, externalB, joinB, delayB, generatorB
+  , start, externalB, delayB, generatorB
   , behaviorFromList, networkToList
   , networkToListGC
 

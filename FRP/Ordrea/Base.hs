@@ -20,9 +20,9 @@ module FRP.Ordrea.Base
   , mapMaybeE, justE, flattenE, expandE, externalE
   , takeWhileE, delayE
 
-  , joinDD, joinDE, joinDB
+  , joinDE, joinDB
 
-  , start, externalB, joinB, delayB, behaviorFromList, networkToList
+  , start, externalB, delayB, behaviorFromList, networkToList
   , networkToListGC, snapshotB
 
   , scanD, changesD, preservesD, delayD
@@ -895,6 +895,11 @@ instance Applicative Discrete where
   pure = pureDiscrete
   (<*>) = apDiscrete
 
+instance Monad Discrete where
+  return = pure
+  (>>) = (*>)
+  x >>= f = joinDD $ f <$> x
+
 newDiscreteInit
   :: a
   -> Initialize ((Pull a, Push), a -> Run (), WeakKey)
@@ -966,50 +971,46 @@ listenToDiscrete key (Dis disprio dis) prio handler = do
   (disPull, disNot) <- dis
   listenToPullPush key disPull disNot prio handler
 
-joinDD :: Discrete (Discrete a) -> SignalGen (Discrete a)
-joinDD outer@ ~(Dis outerprio _) = do
-  here <- genLocation
-  let prio = bottomPrio here
+joinDD :: Discrete (Discrete a) -> (Discrete a)
+joinDD outer@ ~(Dis outerprio _) = Dis prio $ transparentMemoD $ do
   outerRef <- newRef $ error "joinDD: outerRef not initialized"
   (push, trigger) <- liftIO newPush
-  fmap (Dis prio) $ newNode $ do
-    prio `shouldBeGreaterThan` outerprio
-    runSubinit <- makeSubinitializer
-    listenToDiscrete (WeakKey outerRef) outer prio $ \inner -> do
-      debug $ "joinDD: outer"
-      innerRef <- newRef $ error "joinDD: innerRef not initialized"
-      writeRef outerRef innerRef
-      runSubinit $ do
-        listenToDiscrete (WeakKey innerRef) inner prio $ \val -> do
-          currentInnerRef <- readRef outerRef
-          when (currentInnerRef == innerRef) $ do
-            debug $ "joinDD: inner"
-            writeRef innerRef val
-            trigger
-    return (readRef outerRef >>= readRef, push)
+  runSubinit <- makeSubinitializer
+  listenToDiscrete (WeakKey outerRef) outer prio $ \inner -> do
+    debug $ "joinDD: outer"
+    innerRef <- newRef $ error "joinDD: innerRef not initialized"
+    writeRef outerRef innerRef
+    runSubinit $ do
+      listenToDiscrete (WeakKey innerRef) inner prio $ \val -> do
+        currentInnerRef <- readRef outerRef
+        when (currentInnerRef == innerRef) $ do
+          debug $ "joinDD: inner"
+          writeRef innerRef val
+          trigger
+  return (readRef outerRef >>= readRef, push)
+  where
+    prio = nextPrio outerprio
 
-joinDE :: Discrete (Event a) -> SignalGen (Event a)
-joinDE outer@ ~(Dis outerprio _) = do
-  here <- genLocation
-  let prio = bottomPrio here
+joinDE :: Discrete (Event a) -> (Event a)
+joinDE outer@ ~(Dis outerprio _) = Evt prio $ transparentMemoE $ do
   outerRef <- newRef $ error "joinDE: outerRef not initialized"
   (push, trigger) <- liftIO newPush
-  fmap (Evt prio) $ newNode $ do
-    prio `shouldBeGreaterThan` outerprio
-    runSubinit <- makeSubinitializer
-    listenToDiscrete (WeakKey outerRef) outer prio $ \inner -> do
-      debug $ "joinDE: outer"
-      innerRef <- newRef []
-      writeRef outerRef innerRef
-      runSubinit $ do
-        listenToEvent (WeakKey innerRef) inner prio $ \occs -> do
-          currentInnerRef <- readRef outerRef
-          when (currentInnerRef == innerRef) $ do
-            debug $ "joinDE: inner noccs=" ++ show (length occs)
-            writeRef innerRef occs
-            registerFini $ writeRef innerRef []
-            trigger
-    return (readRef outerRef >>= readRef, push)
+  runSubinit <- makeSubinitializer
+  listenToDiscrete (WeakKey outerRef) outer prio $ \inner -> do
+    debug $ "joinDE: outer"
+    innerRef <- newRef []
+    writeRef outerRef innerRef
+    runSubinit $ do
+      listenToEvent (WeakKey innerRef) inner prio $ \occs -> do
+        currentInnerRef <- readRef outerRef
+        when (currentInnerRef == innerRef) $ do
+          debug $ "joinDE: inner noccs=" ++ show (length occs)
+          writeRef innerRef occs
+          registerFini $ writeRef innerRef []
+          trigger
+  return (readRef outerRef >>= readRef, push)
+  where
+    prio = nextPrio outerprio
 
 joinDB :: Discrete (Behavior a) -> SignalGen (Behavior a)
 joinDB outer@ ~(Dis outerprio _) = do
@@ -1042,6 +1043,11 @@ instance Applicative Behavior where
     a_pull <- a_init
     return $ f_pull <*> a_pull
 
+instance Monad Behavior where
+  return = pure
+  (>>) = (*>)
+  x >>= f = joinB $ f <$> x
+
 start :: SignalGen (Behavior a) -> IO (IO a)
 start gensig = do
   ref <- newRef Nothing
@@ -1064,18 +1070,17 @@ externalB :: IO a -> SignalGen (Behavior a)
 externalB get = fmap (Beh (bottomPrio bottomLocation)) $
   newNode $ primStepMemo (liftIO get)
 
-joinB :: Behavior (Behavior a) -> SignalGen (Behavior a)
-joinB ~(Beh _sigsigprio sigsig) = do
-  here <- genLocation
-  let prio = bottomPrio here
-  fmap (Beh prio) $ newNode $ do
-    debug $ "joinB: making pull; prio=" ++ show prio
-    runSubinit <- makeSubinitializer
-    sigpull <- sigsig
-    primStepMemo $ do
-      Beh _sigprio sig <- sigpull
-      pull <- runSubinit sig
-      debugFrame "pull" pull
+joinB :: Behavior (Behavior a) -> Behavior a
+joinB ~(Beh sigsigprio sigsig) = Beh prio $ transparentMemoS $ do
+  debug $ "joinB: making pull; prio=" ++ show prio
+  runSubinit <- makeSubinitializer
+  sigpull <- sigsig
+  return $ do
+    Beh _sigprio sig <- sigpull
+    pull <- runSubinit sig
+    debugFrame "pull" pull
+  where
+    prio = nextPrio sigsigprio
 
 delayB :: a -> Behavior a -> SignalGen (Behavior a)
 delayB initial ~(Beh sigprio sig) = do
@@ -1470,7 +1475,7 @@ test_joinB = do
     beh2 <- behaviorFromList [21, 22, 23, 24]
     beh3 <- behaviorFromList [31, 32, 33, 34]
     behBeh <- behaviorFromList [beh0, beh3, beh2, beh1]
-    joinB behBeh
+    return $ join behBeh
   r @?= [1, 32, 23, 14]
 
 test_delayB = do
@@ -1483,7 +1488,7 @@ test_generatorE = do
   r <- networkToListGC 4 $ do
     evBeh <- generatorE =<< eventFromList [[subnet0], [subnet1], [subnet2], [subnet3]]
     let behBeh = head <$> eventToBehavior evBeh
-    joinB behBeh
+    return $ join behBeh
   r @?= [1, 11, 21, 31]
   where
     subnet0 = behaviorFromList [1, 2, 3, 4::Int]
@@ -1496,8 +1501,7 @@ test_generatorE1 = do
     evEv <- generatorE =<<
       eventFromList [[subnet 0], [subnet 1, subnet 2], [], [subnet 3]]
     dEv <- scanD mempty $ const <$> evEv
-    ev <- joinDE dEv
-    return $ eventToBehavior ev
+    return $ eventToBehavior $ joinDE dEv
   r @?= [[1], [21], [22, 23], [31]]
   where
     subnet k = fmap (10*k+) <$> eventFromList [[1], [2,3], [], [4::Int]]
@@ -1544,7 +1548,7 @@ test_joinDD = do
       inner0 <- discrete "0a" [[], ["0b"], [], ["0c"], ["0d"]]
       inner1 <- discrete "1a" [[], ["1b"], [], ["1c"], ["1d"]]
       outer <- discrete inner0 [[], [inner1], [], [], [inner0]]
-      discreteToBehavior <$> joinDD outer
+      return $ discreteToBehavior $ join outer
 
     discrete initial list = do
       evt <- eventFromList list
@@ -1560,7 +1564,7 @@ test_joinDE = do
       inner0 <- eventFromList [[], ["0b"], [], ["0c"], ["0d"]]
       inner1 <- eventFromList [[], ["1b"], [], ["1c"], ["1d"]]
       outer <- discrete inner0 [[], [inner1], [], [], [inner0]]
-      eventToBehavior <$> joinDE outer
+      return $ eventToBehavior $ joinDE outer
 
     discrete initial list = do
       evt <- eventFromList list
@@ -1688,7 +1692,7 @@ test_mapAccumEM = do
   r <- networkToList 16 $ do
     evt <- eventFromList $ map pure $ iterate (+1) 0
     eE <- mapAccumEM 0 ((\s n -> do e <- eventFromList (replicate n [] ++ [[n]]); return (n+s, e)) <$> evt)
-    intE <- joinDE =<< scanD mempty (mappend <$> eE)
+    intE <- joinDE <$> scanD mempty (mappend <$> eE)
     return $ eventToBehavior intE
   r @?= [[0],[0],[],[1],[],[],[3],[],[],[],[6],[],[],[],[],[10]]
 
@@ -1719,7 +1723,7 @@ test_snapshotB = do
 
     bE <- generatorE $ subnet <$> ev
     bD <- scanD (pure "") $ const <$> bE
-    b <- joinB $ discreteToBehavior bD
+    let b = join $ discreteToBehavior bD
     return $ (show b0++) <$> b
   r @?= ["0", "0", "0", "03c0", "03c1", "03c2"]
 
